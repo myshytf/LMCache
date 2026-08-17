@@ -193,6 +193,116 @@ def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
     assert args[1] == RequestType.REGISTER_KV_CACHE
 
 
+def test_register_kv_caches_accepts_finer_external_chunk_for_dcp_group(
+    monkeypatch,
+):
+    """A DCP manager block may span several complete external chunks."""
+    adapter = LMCacheMPWorkerAdapter.__new__(LMCacheMPWorkerAdapter)
+    adapter.lmcache_tokens_per_chunk = 1_536
+    adapter.kv_caches = {}
+    adapter.engine_group_infos = []
+    send_register = MagicMock()
+    monkeypatch.setattr(
+        adapter,
+        "_send_register_kv_caches_request",
+        send_register,
+    )
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    kv_caches = {"attention": fake_tensor, "recurrent": fake_tensor}
+    groups = [
+        EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0,),
+            tokens_per_block=12_288,
+        ),
+        EngineGroupInfo(
+            engine_group_id=1,
+            layer_indices=(1,),
+            tokens_per_block=1_536,
+        ),
+    ]
+
+    adapter.register_kv_caches(kv_caches, engine_group_infos=groups)
+
+    assert adapter.engine_group_infos == groups
+    send_register.assert_called_once_with(kv_caches)
+
+
+def test_engine_driven_transfer_uses_physical_cache_block_count(
+    fake_adapter, monkeypatch
+):
+    """Worker transfer block counts follow the registered KV tensor layout."""
+    adapter, _send_mock, _ = fake_adapter
+    adapter.lmcache_tokens_per_chunk = 1_536
+    # Scheduler accounting remains in 16-token vLLM manager pages.
+    adapter.blocks_in_chunk = 1_536 // 16
+    adapter._mp_transfer_mode = "engine_driven"
+
+    transfer_ctx = MagicMock(spec=adapter_mod.EngineDrivenTransferContext)
+    transfer_ctx.submit_store.return_value = MagicMock(name="store_future")
+    transfer_ctx.submit_retrieve.return_value = MagicMock(name="retrieve_future")
+    monkeypatch.setattr(
+        adapter_mod,
+        "create_transfer_context",
+        lambda _kv_caches, mode: transfer_ctx,
+    )
+    monkeypatch.setattr(adapter_mod, "vllm_layout_hints", lambda: {})
+    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
+
+    # VLLM format: [2, num_blocks, num_heads, block_size, head_size].
+    kv_caches = {"attention": torch.empty(2, 1, 1, 1_536, 1, dtype=torch.bfloat16)}
+    groups = [EngineGroupInfo(0, (0,), tokens_per_block=12_288)]
+
+    adapter.register_kv_caches(kv_caches, engine_group_infos=groups)
+
+    assert adapter.blocks_in_chunk == 96
+    assert transfer_ctx.register.call_args.args[4] == 1
+
+    op = LoadStoreOp(
+        token_ids=list(range(1_536)),
+        block_ids=[[13]],
+        start=0,
+        end=1_536,
+    )
+    adapter.submit_store_request("fine-object", op, event=MagicMock())
+
+    assert transfer_ctx.submit_store.call_args.args[6] == 1
+
+    adapter.submit_retrieve_request("fine-retrieve", op, event=MagicMock())
+
+    assert transfer_ctx.submit_retrieve.call_args.args[6] == 1
+
+
+def test_engine_driven_registration_rejects_partial_physical_cache_block(
+    fake_adapter, monkeypatch
+):
+    """An external object must contain whole physical KV-cache blocks."""
+    adapter, _send_mock, _ = fake_adapter
+    adapter.lmcache_tokens_per_chunk = 1_536
+    adapter.blocks_in_chunk = 1_536 // 16
+    adapter._mp_transfer_mode = "engine_driven"
+
+    transfer_ctx = MagicMock(spec=adapter_mod.EngineDrivenTransferContext)
+    monkeypatch.setattr(
+        adapter_mod,
+        "create_transfer_context",
+        lambda _kv_caches, mode: transfer_ctx,
+    )
+    monkeypatch.setattr(adapter_mod, "vllm_layout_hints", lambda: {})
+
+    # 1,536 external tokens cannot be represented by whole 1,024-token blocks.
+    kv_caches = {"attention": torch.empty(2, 1, 1, 1_024, 1, dtype=torch.bfloat16)}
+
+    with pytest.raises(
+        ValueError,
+        match="not an integral number of engine-driven physical KV-cache blocks",
+    ):
+        adapter.register_kv_caches(kv_caches)
+
+    transfer_ctx.register.assert_not_called()
+
+
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
     """Public register_kv_caches surfaces ConnectionError on MQ timeout."""
     adapter, _send_mock, future = fake_adapter

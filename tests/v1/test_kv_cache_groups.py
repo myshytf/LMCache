@@ -3,6 +3,7 @@
 import msgspec
 
 # First Party
+from lmcache.v1.multiprocess import group_view
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     expand_engine_block_ids,
@@ -175,6 +176,51 @@ def test_slice_block_ids_nonzero_start_offset():
         end_token_idx=512,
     )
     assert sliced == [list(range(16, 32)), list(range(8, 16))]
+
+
+def test_slice_block_ids_repeats_manager_id_for_finer_external_chunks():
+    allocated = {
+        0: [10, 11, 12, 13],
+        1: list(range(30)),
+    }
+
+    sliced = slice_block_ids_per_group(
+        allocated,
+        group_tokens_per_block=[12_288, 1_536],
+        start_token_idx=36_864,
+        end_token_idx=43_008,
+        external_chunk_size=1_536,
+    )
+
+    assert sliced == [[13, 13, 13, 13], [24, 25, 26, 27]]
+
+
+def test_slice_fine_range_rejects_missing_manager_block():
+    try:
+        slice_block_ids_per_group(
+            {0: [10, 11, 12]},
+            group_tokens_per_block=[12_288],
+            start_token_idx=36_864,
+            end_token_idx=38_400,
+            external_chunk_size=1_536,
+        )
+    except ValueError as exc:
+        assert "does not contain manager block index 3" in str(exc)
+    else:
+        raise AssertionError("Expected incomplete manager table to fail")
+
+
+def test_external_chunk_geometry_accepts_fine_dcp_groups():
+    assert group_view.validate_external_chunk_geometry(1_536, [12_288, 1_536]) == 1_536
+
+
+def test_external_chunk_geometry_rejects_incommensurate_group():
+    try:
+        group_view.validate_external_chunk_geometry(1_536, [10_000])
+    except ValueError as exc:
+        assert "must divide each other exactly" in str(exc)
+    else:
+        raise AssertionError("Expected incommensurate geometry to fail")
 
 
 def test_slice_block_ids_missing_group_yields_empty():
