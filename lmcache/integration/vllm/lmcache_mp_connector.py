@@ -49,7 +49,10 @@ from lmcache.integration.vllm.kv_cache_groups import (
 )
 from lmcache.integration.vllm.utils import mla_enabled, vllm_layout_hints
 from lmcache.utils import init_logger as lmcache_init_logger
-from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
+from lmcache.v1.multiprocess.group_view import (
+    slice_block_ids_per_group,
+    validate_external_chunk_geometry,
+)
 
 try:
     # First Party
@@ -344,8 +347,8 @@ class LMCacheMPRequestMetadata:
             lmcache_tokens_per_chunk: the number of tokens in a LMCache data chunk
             group_tokens_per_block: per-engine-group tokens covered by one
                 paged chunk (one block ID) of that group, i.e. the group's
-                KV cache spec ``block_size``. Must each divide
-                ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+                KV cache spec ``block_size``. Each group span must evenly divide,
+                or be evenly divided by, ``lmcache_tokens_per_chunk``.
         """
         num_engine_groups = len(group_tokens_per_block)
         # NOTE: the invariant here is that `num_stored_tokens` should
@@ -402,6 +405,7 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
+                external_chunk_size=lmcache_tokens_per_chunk,
             )
             token_ids = list(tracker.all_token_ids)
             op = LoadStoreOp(
@@ -438,8 +442,8 @@ class LMCacheMPRequestMetadata:
             lmcache_tokens_per_chunk: the number of tokens in a LMCache data chunk
             group_tokens_per_block: per-engine-group tokens covered by one
                 paged chunk (one block ID) of that group, i.e. the group's
-                KV cache spec ``block_size``. Must each divide
-                ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+                KV cache spec ``block_size``. Each group span must evenly divide,
+                or be evenly divided by, ``lmcache_tokens_per_chunk``.
         """
         if not tracker.is_ready_for_retrieving():
             return None
@@ -469,6 +473,7 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
+                external_chunk_size=lmcache_tokens_per_chunk,
             )
             token_ids = list(tracker.all_token_ids)
 
@@ -704,22 +709,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     f"group {engine_group_idx} tokens_per_block "
                     f"{tokens_per_block} must be positive"
                 )
-        # Smallest token count aligned to every group's paged-chunk
-        # boundary; used to round down vLLM APC hit counts.
-        self._hit_alignment_tokens = math.lcm(*self._group_tokens_per_block)
         if self.role == KVConnectorRole.SCHEDULER:
-            # Chunk boundaries must land on every group's paged-chunk
-            # boundary so per-group block-id slicing stays aligned.
             lmcache_tokens_per_chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
-            for engine_group_idx, tokens_per_block in enumerate(
-                self._group_tokens_per_block
-            ):
-                if lmcache_tokens_per_chunk % tokens_per_block != 0:
-                    raise ValueError(
-                        f"LMCache chunk size {lmcache_tokens_per_chunk} must be "
-                        f"a multiple of group {engine_group_idx} "
-                        f"tokens_per_block {tokens_per_block}"
-                    )
+            self._hit_alignment_tokens = validate_external_chunk_geometry(
+                lmcache_tokens_per_chunk,
+                self._group_tokens_per_block,
+            )
+        else:
+            # Worker-side code does not combine scheduler-local hits. Keep the
+            # historical value until registration validates physical geometry.
+            self._hit_alignment_tokens = math.lcm(*self._group_tokens_per_block)
 
     @property
     def role(self) -> KVConnectorRole:
@@ -1012,10 +1011,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # Update num stored tokens for the tracker
         tracker.increase_num_stored_tokens(ret)
 
-        # Save the vllm and lmcache hit tokens. The vLLM hit count is
-        # rounded down to a boundary aligned for every engine group (e.g.
-        # a full-prompt APC hit reports ``num_prompt_tokens - 1``), so the
-        # retrieve-skip range stays paged-chunk-aligned in all groups.
+        # Save the vLLM and LMCache hit tokens. Round the local hit down to an
+        # external-object boundary (for example, a full-prompt APC hit reports
+        # ``num_prompt_tokens - 1``). Fine DCP geometry projects that boundary
+        # to a complete rank-local transfer sub-block before scatter.
         tracker.num_vllm_hit_tokens = (
             num_computed_tokens
             // self._hit_alignment_tokens

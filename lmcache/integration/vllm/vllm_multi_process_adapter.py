@@ -34,6 +34,7 @@ from lmcache.v1.multiprocess.transfer_context import (
     TransferContext,
     create_transfer_context,
 )
+from lmcache.v1.multiprocess.transfer_context.base import compute_kv_layout
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 from lmcache.v1.platform import resolve_kv_wrapper_factory
 
@@ -1206,6 +1207,10 @@ class LMCacheMPWorkerAdapter:
             "LMCache chunk size should be a multiple of vLLM block size"
         )
         self.blocks_in_chunk = lmcache_tokens_per_chunk // vllm_block_size
+        # Scheduler block counts use vLLM's manager-page size. Engine-driven
+        # gather/scatter counts are recomputed from the registered KV tensor's
+        # physical page size once the cache layout is available.
+        self._transfer_blocks_in_chunk = self.blocks_in_chunk
 
         # Health state (shared with heartbeat thread)
         self._health_event = threading.Event()
@@ -1286,20 +1291,22 @@ class LMCacheMPWorkerAdapter:
         Raises:
             ConnectionError: if the server does not respond within
                 mq_timeout.
-            ValueError: if the LMCache chunk size is not a multiple of an
-                engine group's ``tokens_per_block`` (chunk boundaries would
-                not align with that group's paged-chunk boundaries).
+            ValueError: if the LMCache chunk size and an engine group's
+                ``tokens_per_block`` do not divide one another exactly, or an
+                engine-driven external object is not an integral number of
+                physical KV-cache blocks.
         """
         logger.info("Registering kv caches")
         for info in engine_group_infos:
             if (
                 info.tokens_per_block > 0
                 and self.lmcache_tokens_per_chunk % info.tokens_per_block
+                and info.tokens_per_block % self.lmcache_tokens_per_chunk
             ):
                 raise ValueError(
-                    f"LMCache chunk size {self.lmcache_tokens_per_chunk} must be a "
-                    f"multiple of engine group {info.engine_group_id} "
-                    f"tokens_per_block {info.tokens_per_block}"
+                    f"LMCache chunk size {self.lmcache_tokens_per_chunk} and "
+                    f"engine group {info.engine_group_id} tokens_per_block "
+                    f"{info.tokens_per_block} must divide each other exactly"
                 )
         self.kv_caches = kv_caches
         self.engine_group_infos = list(engine_group_infos)
@@ -1327,6 +1334,20 @@ class LMCacheMPWorkerAdapter:
         self.kv_caches = kv_caches
         transfer_ctx = create_transfer_context(kv_caches, mode=self._mp_transfer_mode)
         layout_hints = vllm_layout_hints()
+        transfer_blocks_in_chunk = self.blocks_in_chunk
+        if isinstance(transfer_ctx, EngineDrivenTransferContext):
+            physical_block_size, *_ = compute_kv_layout(
+                kv_caches, layout_hints=layout_hints
+            )
+            if self.lmcache_tokens_per_chunk % physical_block_size:
+                raise ValueError(
+                    f"LMCache chunk size {self.lmcache_tokens_per_chunk} is not "
+                    "an integral number of engine-driven physical KV-cache "
+                    f"blocks of size {physical_block_size}"
+                )
+            transfer_blocks_in_chunk = (
+                self.lmcache_tokens_per_chunk // physical_block_size
+            )
         self.transfer_ctx = transfer_ctx
         try:
             # Register on the local, not self.transfer_ctx: a concurrent
@@ -1337,13 +1358,14 @@ class LMCacheMPWorkerAdapter:
                 kv_caches,
                 self.model_name,
                 self.world_size,
-                self.blocks_in_chunk,
+                transfer_blocks_in_chunk,
                 self.mq_client,
                 self._mq_timeout,
                 send_request=send_lmcache_request,
                 layout_hints=layout_hints,
                 engine_group_infos=self.engine_group_infos,
             )
+            self._transfer_blocks_in_chunk = transfer_blocks_in_chunk
         except TimeoutError:
             raise ConnectionError(
                 "LMCache server did not respond to "
@@ -1469,7 +1491,7 @@ class LMCacheMPWorkerAdapter:
             self.kv_caches,
             self._block_ids_per_group(op),
             event,
-            self.blocks_in_chunk,
+            self._transfer_blocks_in_chunk,
         )
         # Chunked prefill can submit multiple stores for one request before
         # earlier stores finish. Keep every future and its exporting event.
@@ -1526,7 +1548,7 @@ class LMCacheMPWorkerAdapter:
             self.kv_caches,
             self._block_ids_per_group(op),
             event,
-            self.blocks_in_chunk,
+            self._transfer_blocks_in_chunk,
             skip_first_n_tokens=op.skip_first_n_tokens,
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
