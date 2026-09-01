@@ -19,6 +19,12 @@ from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     IPCEvent,
     _single_group_block_ids,
 )
+import os  # kimi-k3-async-multigroup-store
+from lmcache.v1.multiprocess.transfer_context.pickle import (  # kimi-k3-async-multigroup-store
+    EngineDrivenContextPickle,
+)
+
+_ASYNC_MULTIGROUP_STORE = os.environ.get("LMCACHE_ASYNC_MULTIGROUP_STORE", "1") == "1"  # kimi-k3-async-multigroup-store
 
 logger = init_logger(__name__)
 
@@ -191,9 +197,14 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 "Call register() before submit_store()."
             )
         if self._group_states:
-            # Multi-group stores take the synchronous per-group path for now;
-            # the wait-for-forward-event + copy-stream pipelining below is
-            # single-group. TODO: pipeline the grouped gather as well.
+            # kimi-k3-async-multigroup-store: multi-group stores run the same three-phase background
+            # pipeline as single-group stores unless disabled by env.
+            if _ASYNC_MULTIGROUP_STORE and not isinstance(
+                self._engine_driven_context, EngineDrivenContextPickle
+            ):
+                return self._submit_store_multigroup_async(
+                    _request_id, key, instance_id, kv_caches, block_ids, _event
+                )
             _event.wait()
             return self._submit_store_multigroup(key, instance_id, kv_caches, block_ids)
         completion: MessagingFuture[bool] = MessagingFuture()
@@ -329,6 +340,124 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             return completion
 
         return completion
+
+    # kimi-k3-async-multigroup-store: begin
+    def _submit_store_multigroup_async(
+        self,
+        _request_id: str,
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        _event: IPCEvent,
+    ) -> MessagingFuture:
+        """Three-phase background store for multi-group (hybrid) KV layouts.
+
+        Mirrors `_submit_store_multigroup` (same prepare/gather/commit calls
+        and per-group slot mapping) but off the forward thread: the copy
+        stream waits on the forward's CUDA event instead of a device
+        synchronize, and the gather's completion event is tracked in
+        `_inflight_gather_events` so `flush_inflight_stores` blocks before
+        vLLM may overwrite the paged blocks. PREPARE_STORE and COMMIT hold
+        `_commit_lock` so stores of one worker stay ordered on the socket.
+        """
+        ctx = self._engine_driven_context
+        assert ctx is not None
+        completion: MessagingFuture[bool] = MessagingFuture()
+        if len(block_ids) != len(self._group_states):
+            raise RuntimeError(
+                f"got {len(block_ids)} block-id lists for "
+                f"{len(self._group_states)} registered groups"
+            )
+        # Validate and project every group's inputs on the forward thread so a
+        # malformed store fails before any server-side slot is reserved.
+        transfer_inputs = [
+            self._group_transfer_inputs(state, key, kv_caches, block_ids[gid])
+            for gid, state in enumerate(self._group_states)
+        ]
+        group_states = list(self._group_states)
+        gather_launched = threading.Event()
+        try:
+            with self._inflight_lock:
+                if self._is_closing:
+                    completion.set_result(False)
+                    return completion
+                self._pending_stores.add(gather_launched)
+
+            def _prepare_gather_and_commit_grouped() -> None:
+                gather_done: Any | None = None
+                ok = False
+                try:
+                    # Executor threads start on CUDA device 0; pin this thread to
+                    # the worker's device so the stream context never creates
+                    # a context on another rank's GPU (observed as CUDA OOM on
+                    # ranks 1-7 when restoring the previous stream).
+                    torch_dev.set_device(self._copy_stream.device)
+                    with self._commit_lock:
+                        result = ctx.prepare_store_grouped(key, instance_id)
+                    if result is None:
+                        return
+                    tensors, chunk_indices, group_ids = result
+                    if not tensors:
+                        ok = True
+                        return
+                    with torch.inference_mode(), torch_dev.stream(self._copy_stream):
+                        _event.wait(stream=self._copy_stream)
+                        for gid, state in enumerate(group_states):
+                            out_g, chunks_g = self._group_slots(
+                                tensors, group_ids, gid, chunk_indices
+                            )
+                            if not out_g:
+                                continue
+                            transfer_kv_caches, transfer_block_ids = transfer_inputs[gid]
+                            gather_paged_kv_to_cpu(
+                                transfer_kv_caches,
+                                transfer_block_ids,
+                                state.blocks_in_chunk,
+                                layout_hints=self._layout_hints,
+                                engine_kv_format=state.engine_kv_format,
+                                out=out_g,
+                                chunk_indices=chunks_g,
+                                blocks_per_window=state.blocks_per_window,
+                            )
+                        gather_done = torch_dev.Event()
+                        gather_done.record(self._copy_stream)
+                    with self._inflight_lock:
+                        self._inflight_gather_events.add(gather_done)
+                        self._pending_stores.discard(gather_launched)
+                    gather_launched.set()
+                    gather_done.synchronize()
+                    with self._commit_lock:
+                        ok = ctx.commit_store(key, instance_id, [])
+                    if not ok:
+                        logger.error(
+                            "Async grouped commit_store failed for request_id=%s",
+                            _request_id,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Async grouped engine-driven store failed for request_id=%s",
+                        _request_id,
+                    )
+                    ok = False
+                finally:
+                    with self._inflight_lock:
+                        if gather_done is not None:
+                            self._inflight_gather_events.discard(gather_done)
+                        self._pending_stores.discard(gather_launched)
+                    gather_launched.set()
+                    completion.set_result(ok)
+
+            self._commit_executor.submit(_prepare_gather_and_commit_grouped)
+        except Exception:
+            logger.exception("Failed to submit async grouped engine-driven store")
+            with self._inflight_lock:
+                self._pending_stores.discard(gather_launched)
+            gather_launched.set()
+            completion.set_result(False)
+            return completion
+        return completion
+    # kimi-k3-async-multigroup-store: end
 
     def flush_inflight_stores(self) -> None:
         """Synchronize all in-flight gather (GPU->CPU) events.
