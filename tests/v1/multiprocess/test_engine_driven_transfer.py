@@ -849,6 +849,61 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip(
             assert torch.allclose(source[name][1], destination[name][5])
 
 
+def test_mla_gather_scatter_honors_block_interleaved_layer_stride() -> None:
+    """Round-trip a layer view whose block stride includes adjacent layers."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    num_blocks = 3
+    num_layers = 3
+    block_size = 4
+    hidden_size = 16
+    source_backing = torch.empty(
+        (num_blocks, num_layers, block_size, hidden_size),
+        dtype=torch.uint8,
+        device=torch_device_type,
+    )
+    for block in range(num_blocks):
+        for layer in range(num_layers):
+            source_backing[block, layer].fill_(block * 10 + layer)
+    source = {f"layer_{layer}": source_backing[:, layer] for layer in range(num_layers)}
+    assert source["layer_0"].stride(0) == num_layers * block_size * hidden_size
+
+    gathered = gather_paged_kv_to_cpu(source, [1], blocks_per_chunk=1)
+
+    assert len(gathered) == 1
+    assert tuple(gathered[0].shape) == (num_layers, block_size, hidden_size)
+    for layer in range(num_layers):
+        expected = torch.full(
+            (block_size, hidden_size),
+            10 + layer,
+            dtype=torch.uint8,
+        )
+        assert torch.equal(gathered[0][layer], expected)
+
+    destination_backing = torch.zeros_like(source_backing)
+    destination = {
+        f"layer_{layer}": destination_backing[:, layer] for layer in range(num_layers)
+    }
+    scatter_cpu_to_paged_kv(
+        destination,
+        [2],
+        gathered,
+        blocks_per_chunk=1,
+    )
+    torch_dev.synchronize()
+
+    for layer in range(num_layers):
+        assert torch.equal(
+            destination_backing[2, layer].cpu(),
+            source_backing[1, layer].cpu(),
+        )
+    assert int(torch.count_nonzero(destination_backing[:2]).item()) == 0
+
+
 @pytest.mark.parametrize(
     ("hnd_builder", "expected_format"),
     [

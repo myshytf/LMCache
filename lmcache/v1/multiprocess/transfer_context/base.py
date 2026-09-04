@@ -351,6 +351,43 @@ def compute_kv_layout(
     )
 
 
+def _engine_block_stride_elems(
+    kv_caches: object,
+    engine_kv_format: "lmc_ops.EngineKVFormat",
+) -> int | None:
+    """Return the physical block stride for per-layer MLA page views.
+
+    Args:
+        kv_caches: Normalized cache structure returned by format discovery.
+        engine_kv_format: Discovered engine cache format.
+
+    Returns:
+        The first layer tensor's dim-0 stride in source-dtype elements for
+        vLLM MLA, or ``None`` for formats whose block addressing is tight or
+        represented by another dimension.
+
+    Raises:
+        TypeError: If an MLA cache is not a non-empty list of tensors.
+
+    vLLM can expose a logical ``[blocks, tokens, hidden]`` layer as a view of a
+    block-major ``[blocks, layers, tokens, hidden]`` allocation. Its dim-0
+    stride then includes every interleaved layer and is larger than one page.
+    The native transfer descriptor accepts this physical stride explicitly.
+    """
+    # First Party
+    import lmcache.c_ops as lmc_ops
+
+    if engine_kv_format != lmc_ops.EngineKVFormat.NL_X_NB_BS_HS:
+        return None
+    if (
+        not isinstance(kv_caches, list)
+        or not kv_caches
+        or not isinstance(kv_caches[0], torch.Tensor)
+    ):
+        raise TypeError("vLLM MLA cache must be a non-empty list of tensors")
+    return int(kv_caches[0].stride(0))
+
+
 def _object_group_geometry(
     blocks_per_chunk: int,
     blocks_per_window: int,
@@ -466,6 +503,7 @@ def gather_paged_kv_to_cpu(
         num_layers_in_group=num_layers,
         num_blocks=num_blocks,
         block_size=block_size,
+        block_stride_elems=_engine_block_stride_elems(normalized, engine_kv_format),
     )
 
     iter_indices = (
@@ -745,6 +783,7 @@ def scatter_cpu_to_paged_kv(
         num_layers_in_group=num_layers,
         num_blocks=num_blocks,
         block_size=block_size,
+        block_stride_elems=_engine_block_stride_elems(normalized, engine_kv_format),
     )
 
     selected_block_ids: list[int] = []
