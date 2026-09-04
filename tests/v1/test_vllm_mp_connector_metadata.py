@@ -74,13 +74,14 @@ def _tracker(
     ("group_tokens_per_block", "allocated_block_ids", "expected_block_ids"),
     [
         # Single group, plain geometry: 64 tokens / 16 tokens per block.
-        ([16], {0: [0, 1, 2, 3]}, [[0, 1, 2, 3]]),
+        # Block id 0 is vLLM's null placeholder, so real ids start at 1.
+        ([16], {0: [1, 2, 3, 4]}, [[1, 2, 3, 4]]),
         # Single group, DCP-scaled: one manager block id covers 64 tokens.
         ([64], {0: [5]}, [[5]]),
         # Hybrid geometries: each group sliced by its own tokens-per-block.
-        ([16, 32], {0: [0, 1, 2, 3], 1: [10, 11]}, [[0, 1, 2, 3], [10, 11]]),
+        ([16, 32], {0: [1, 2, 3, 4], 1: [10, 11]}, [[1, 2, 3, 4], [10, 11]]),
         # Extra allocated blocks beyond the range are fine (and not emitted).
-        ([16], {0: [0, 1, 2, 3, 4, 5]}, [[0, 1, 2, 3]]),
+        ([16], {0: [1, 2, 3, 4, 5, 6]}, [[1, 2, 3, 4]]),
     ],
 )
 def test_retrieve_metadata_emitted_when_allocation_covers_range(
@@ -148,7 +149,7 @@ def test_retrieve_metadata_skip_tokens_preserved_on_emitted_op() -> None:
         num_tokens=CHUNK_TOKENS,
         lmcache_hit_tokens=CHUNK_TOKENS,
         vllm_hit_tokens=16,
-        allocated_block_ids={0: [0, 1, 2, 3]},
+        allocated_block_ids={0: [1, 2, 3, 4]},
     )
 
     metadata = LMCacheMPRequestMetadata.GetRetrieveMetadata(tracker, CHUNK_TOKENS, [16])
@@ -173,7 +174,7 @@ def _lookup_tracker(
         num_tokens=lmcache_hit_tokens + CHUNK_TOKENS,
         lmcache_hit_tokens=lmcache_hit_tokens,
         vllm_hit_tokens=vllm_hit_tokens,
-        allocated_block_ids={0: list(range(8))},
+        allocated_block_ids={0: list(range(1, 13))},
     )
     tracker.state = LMCacheMPRequestState.PREFETCHING
     return tracker
@@ -228,7 +229,7 @@ def test_retrieve_metadata_stops_at_admitted_external_range() -> None:
     assert metadata is not None
     assert metadata.op.start == 0
     assert metadata.op.end == 2 * CHUNK_TOKENS
-    assert metadata.op.block_ids == [list(range(8))]
+    assert metadata.op.block_ids == [list(range(1, 9))]
 
 
 class _RecordingSchedulerAdapter:
@@ -271,7 +272,7 @@ def test_update_state_after_alloc_with_zero_admitted_tokens_skips_retrieve() -> 
     tracker = _lookup_tracker(3 * CHUNK_TOKENS, 0)
     connector, adapter = _connector_with_tracker(tracker)
     request = SimpleNamespace(request_id=tracker.request_id)
-    blocks = SimpleNamespace(get_block_ids=lambda: ([0, 1, 2, 3, 4, 5, 6, 7],))
+    blocks = SimpleNamespace(get_block_ids=lambda: ([1, 2, 3, 4, 5, 6, 7, 8],))
 
     connector.update_state_after_alloc(request, blocks, 0)
 
@@ -285,7 +286,7 @@ def test_update_state_after_alloc_partial_admission_frees_unadmitted_tail() -> N
     tracker = _lookup_tracker(3 * CHUNK_TOKENS, 0)
     connector, adapter = _connector_with_tracker(tracker)
     request = SimpleNamespace(request_id=tracker.request_id)
-    blocks = SimpleNamespace(get_block_ids=lambda: ([0, 1, 2, 3, 4, 5, 6, 7],))
+    blocks = SimpleNamespace(get_block_ids=lambda: ([1, 2, 3, 4, 5, 6, 7, 8],))
 
     connector.update_state_after_alloc(request, blocks, CHUNK_TOKENS)
 
@@ -298,10 +299,90 @@ def test_update_state_after_alloc_full_admission_keeps_full_retrieve() -> None:
     tracker = _lookup_tracker(3 * CHUNK_TOKENS, 0)
     connector, adapter = _connector_with_tracker(tracker)
     request = SimpleNamespace(request_id=tracker.request_id)
-    blocks = SimpleNamespace(get_block_ids=lambda: ([0, 1, 2, 3, 4, 5, 6, 7],))
+    blocks = SimpleNamespace(get_block_ids=lambda: ([1, 2, 3, 4, 5, 6, 7, 8],))
 
     connector.update_state_after_alloc(request, blocks, 3 * CHUNK_TOKENS)
 
     assert tracker.state is LMCacheMPRequestState.WAITING_FOR_LOAD
     assert tracker.retrieve_end_token(CHUNK_TOKENS) == 3 * CHUNK_TOKENS
     assert adapter.freed == []
+
+
+# ---------------------------------------------------------------------------
+# Null placeholder blocks are never transfer sources or destinations.
+# ---------------------------------------------------------------------------
+
+HYBRID_GROUP_TOKENS = [8 * CHUNK_TOKENS, CHUNK_TOKENS]
+
+
+def _hybrid_store_tracker(
+    recurrent_block_ids: list[int],
+    num_computed_tokens: int,
+) -> LMCacheMPRequestTracker:
+    """A hybrid request whose attention group owns one DCP-scaled block."""
+    request = SimpleNamespace(
+        request_id="req-hybrid",
+        cache_salt="",
+        all_token_ids=list(range(num_computed_tokens + 8)),
+    )
+    tracker = LMCacheMPRequestTracker(request)
+    tracker.allocated_block_ids = {0: [13], 1: recurrent_block_ids}
+    tracker.num_scheduled_tokens = num_computed_tokens
+    return tracker
+
+
+def test_store_stops_before_first_null_backed_chunk() -> None:
+    """A recurrent checkpoint slot holding the null block has no state to
+    persist; storing it would publish placeholder bytes as cache content."""
+    tracker = _hybrid_store_tracker([1, 0, 3, 4], 4 * CHUNK_TOKENS)
+
+    metadata = LMCacheMPRequestMetadata.GetStoreMetadata(
+        tracker, CHUNK_TOKENS, HYBRID_GROUP_TOKENS
+    )
+
+    assert metadata is not None
+    assert metadata.op.start == 0
+    assert metadata.op.end == CHUNK_TOKENS
+    assert metadata.op.block_ids == [[13], [1]]
+    assert tracker.num_stored_tokens == CHUNK_TOKENS
+
+
+def test_store_emits_nothing_when_first_chunk_is_null_backed() -> None:
+    tracker = _hybrid_store_tracker([0, 0, 3, 4], 4 * CHUNK_TOKENS)
+
+    metadata = LMCacheMPRequestMetadata.GetStoreMetadata(
+        tracker, CHUNK_TOKENS, HYBRID_GROUP_TOKENS
+    )
+
+    assert metadata is None
+    assert tracker.num_stored_tokens == 0
+
+
+def test_store_keeps_full_range_without_null_blocks() -> None:
+    tracker = _hybrid_store_tracker([1, 2, 3, 4], 4 * CHUNK_TOKENS)
+
+    metadata = LMCacheMPRequestMetadata.GetStoreMetadata(
+        tracker, CHUNK_TOKENS, HYBRID_GROUP_TOKENS
+    )
+
+    assert metadata is not None
+    assert metadata.op.end == 4 * CHUNK_TOKENS
+    assert metadata.op.block_ids == [[13, 13, 13, 13], [1, 2, 3, 4]]
+
+
+def test_retrieve_marks_null_destinations_skipped() -> None:
+    """Placeholder destinations reach the worker as skipped ids; the
+    attention group's ids are untouched and coverage is still satisfied."""
+    tracker = _tracker(
+        num_tokens=3 * CHUNK_TOKENS,
+        lmcache_hit_tokens=3 * CHUNK_TOKENS,
+        vllm_hit_tokens=0,
+        allocated_block_ids={0: [13], 1: [0, 0, 3, 4]},
+    )
+
+    metadata = LMCacheMPRequestMetadata.GetRetrieveMetadata(
+        tracker, CHUNK_TOKENS, HYBRID_GROUP_TOKENS
+    )
+
+    assert metadata is not None
+    assert metadata.op.block_ids == [[13, 13, 13], [-1, -1, 3]]

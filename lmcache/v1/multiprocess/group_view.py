@@ -322,6 +322,108 @@ def slice_block_ids_per_group(
     return sliced
 
 
+# Manager block id a request-side connector substitutes for a block that has
+# no transferable destination or source in one engine group. Worker-side
+# transfer code drops the external chunks that map to it for that group only.
+SKIPPED_BLOCK_ID = -1
+
+
+def chunk_block_ids(
+    group_block_ids: Sequence[int],
+    tokens_per_block: int,
+    external_chunk_size: int,
+    num_chunks: int,
+) -> list[list[int]]:
+    """Group one engine group's sliced block ids by external chunk.
+
+    ``group_block_ids`` must come from :func:`slice_block_ids_per_group` for
+    the same geometry: coarse groups list ``external_chunk_size //
+    tokens_per_block`` ids per chunk, fine groups repeat one manager id per
+    chunk.
+
+    Args:
+        group_block_ids: Block ids of one engine group for the sliced range.
+        tokens_per_block: Global token span of one manager block in the group.
+        external_chunk_size: Global token span of one external object.
+        num_chunks: Number of external chunks in the sliced range.
+
+    Returns:
+        ``num_chunks`` lists, one per external chunk in range order.
+
+    Raises:
+        ValueError: If the id count does not match the chunk geometry.
+    """
+    if tokens_per_block <= 0 or external_chunk_size <= 0 or num_chunks < 0:
+        raise ValueError("chunk geometry values must be positive")
+    ids_per_chunk = (
+        external_chunk_size // tokens_per_block
+        if external_chunk_size >= tokens_per_block
+        else 1
+    )
+    if len(group_block_ids) != ids_per_chunk * num_chunks:
+        raise ValueError(
+            f"{len(group_block_ids)} block ids do not cover {num_chunks} chunks "
+            f"of {ids_per_chunk} id(s)"
+        )
+    return [
+        list(group_block_ids[chunk * ids_per_chunk : (chunk + 1) * ids_per_chunk])
+        for chunk in range(num_chunks)
+    ]
+
+
+def first_chunk_using_block(
+    block_ids_per_group: Sequence[Sequence[int]],
+    group_tokens_per_block: Sequence[int],
+    external_chunk_size: int,
+    num_chunks: int,
+    block_id: int,
+) -> int | None:
+    """Return the first external chunk that maps to ``block_id`` in any group.
+
+    Args:
+        block_ids_per_group: Per-group block ids from
+            :func:`slice_block_ids_per_group` for the same range.
+        group_tokens_per_block: Global token span of one manager block per
+            engine group.
+        external_chunk_size: Global token span of one external object.
+        num_chunks: Number of external chunks in the range.
+        block_id: Manager block id to search for.
+
+    Returns:
+        The chunk index, or ``None`` when no group maps a chunk to ``block_id``.
+    """
+    first: int | None = None
+    for group_ids, tokens_per_block in zip(
+        block_ids_per_group, group_tokens_per_block, strict=True
+    ):
+        for chunk, ids in enumerate(
+            chunk_block_ids(group_ids, tokens_per_block, external_chunk_size, num_chunks)
+        ):
+            if block_id in ids:
+                first = chunk if first is None else min(first, chunk)
+                break
+    return first
+
+
+def mark_block_id_skipped(
+    block_ids_per_group: Sequence[Sequence[int]],
+    block_id: int,
+) -> list[list[int]]:
+    """Replace every occurrence of ``block_id`` with :data:`SKIPPED_BLOCK_ID`.
+
+    Args:
+        block_ids_per_group: Per-group block id lists of one transfer op.
+        block_id: Manager block id that must not be transferred.
+
+    Returns:
+        New per-group lists with the substitution applied.
+    """
+    return [
+        [SKIPPED_BLOCK_ID if bid == block_id else bid for bid in group_ids]
+        for group_ids in block_ids_per_group
+    ]
+
+
 def get_engine_group_indices(
     groups: Sequence[EngineGroupInfo],
     num_registered_layers: int,

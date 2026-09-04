@@ -12,7 +12,11 @@ import torch
 # First Party
 from lmcache.v1.multiprocess import custom_types
 from lmcache.v1.multiprocess.group_view import (
+    SKIPPED_BLOCK_ID,
     EngineGroupInfo,
+    chunk_block_ids,
+    first_chunk_using_block,
+    mark_block_id_skipped,
     slice_block_ids_per_group,
 )
 from lmcache.v1.multiprocess.protocols.engine import (
@@ -530,4 +534,152 @@ def test_pickle_retrieve_uses_fine_group_projection(monkeypatch) -> None:
             "blocks_in_chunk": 1,
             "skip_first_n_tokens": 8,
         },
+    ]
+
+
+def test_submit_retrieve_drops_skipped_recurrent_prefix(monkeypatch) -> None:
+    """Chunks whose recurrent destination is marked skipped (a null placeholder
+    block) are not scattered for that group, while the attention group still
+    loads the whole range."""
+    context, kv_caches = _register_fine_context(monkeypatch, _CapturingGroupedContext())
+    calls: list[dict[str, Any]] = []
+
+    def record_scatter(
+        group_kv_caches: dict[str, torch.Tensor],
+        block_ids: list[int],
+        chunks: list[torch.Tensor],
+        blocks_in_chunk: int,
+        **kwargs: Any,
+    ) -> None:
+        tensor = next(iter(group_kv_caches.values()))
+        calls.append(
+            {
+                "shape": tuple(tensor.shape),
+                "block_ids": block_ids,
+                "num_chunks": len(chunks),
+                "skip_first_n_tokens": kwargs["skip_first_n_tokens"],
+            }
+        )
+
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", record_scatter)
+    future = context.submit_retrieve(
+        "request",
+        _fine_key(),
+        1,
+        kv_caches,
+        [[13, 13, 13, 13], [-1, -1, 26, 27]],
+        MagicMock(),
+        1,
+        skip_first_n_tokens=8,
+    )
+
+    assert future.result(timeout=1) is True
+    assert calls == [
+        {
+            "shape": (240, 1, 1),
+            "block_ids": [104, 105, 106, 107],
+            "num_chunks": 4,
+            "skip_first_n_tokens": 1,
+        },
+        {
+            "shape": (30, 8, 1),
+            "block_ids": [26, 27],
+            "num_chunks": 2,
+            "skip_first_n_tokens": 0,
+        },
+    ]
+
+
+def test_submit_retrieve_skips_group_whose_range_is_fully_skipped(monkeypatch) -> None:
+    context, kv_caches = _register_fine_context(monkeypatch, _CapturingGroupedContext())
+    shapes: list[tuple[int, ...]] = []
+
+    def record_scatter(group_kv_caches: dict[str, torch.Tensor], *_args, **_kwargs) -> None:
+        shapes.append(tuple(next(iter(group_kv_caches.values())).shape))
+
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", record_scatter)
+    future = context.submit_retrieve(
+        "request",
+        _fine_key(),
+        1,
+        kv_caches,
+        [[13, 13, 13, 13], [-1, -1, -1, -1]],
+        MagicMock(),
+        1,
+    )
+
+    assert future.result(timeout=1) is True
+    assert shapes == [(240, 1, 1)]
+
+
+def test_submit_retrieve_fails_closed_on_interior_skipped_chunk(monkeypatch) -> None:
+    """A skipped destination after a kept chunk cannot be expressed as a
+    contiguous suffix; the retrieve reports failure so the engine recomputes."""
+    context, kv_caches = _register_fine_context(monkeypatch, _CapturingGroupedContext())
+    monkeypatch.setattr(
+        worker_transfer, "scatter_cpu_to_paged_kv", lambda *_a, **_k: None
+    )
+    future = context.submit_retrieve(
+        "request",
+        _fine_key(),
+        1,
+        kv_caches,
+        [[13, 13, 13, 13], [24, -1, 26, 27]],
+        MagicMock(),
+        1,
+    )
+
+    assert future.result(timeout=1) is False
+
+
+@pytest.mark.parametrize(
+    ("block_ids", "blocks_in_chunk", "expected_ids", "expected_dropped"),
+    [
+        ([-1, -1, 26, 27], 1, [26, 27], 2),
+        ([24, 25, 26, 27], 1, [24, 25, 26, 27], 0),
+        ([-1, -1, -1, -1], 1, [], 4),
+        ([-1, 5, 6, 7, 8, 9, 10, 11], 2, [6, 7, 8, 9, 10, 11], 1),
+    ],
+)
+def test_drop_skipped_chunks_removes_leading_prefix(
+    block_ids: list[int],
+    blocks_in_chunk: int,
+    expected_ids: list[int],
+    expected_dropped: int,
+) -> None:
+    chunks = [torch.full((1,), float(i)) for i in range(len(block_ids) // blocks_in_chunk)]
+
+    kept, ids, dropped = worker_transfer._drop_skipped_chunks(
+        chunks, block_ids, blocks_in_chunk
+    )
+
+    assert ids == expected_ids
+    assert dropped == expected_dropped
+    assert [float(c[0]) for c in kept] == [float(i) for i in range(dropped, len(chunks))]
+
+
+def test_drop_skipped_chunks_rejects_interior_skip() -> None:
+    chunks = [torch.zeros(1) for _ in range(3)]
+    with pytest.raises(ValueError, match="only leading chunks"):
+        worker_transfer._drop_skipped_chunks(chunks, [24, -1, 26], 1)
+
+
+def test_chunk_block_ids_groups_coarse_and_fine_ids_per_chunk() -> None:
+    assert chunk_block_ids([13, 13, 13], 12_288, 1_536, 3) == [[13], [13], [13]]
+    assert chunk_block_ids([4, 5, 6, 7], 768, 1_536, 2) == [[4, 5], [6, 7]]
+    with pytest.raises(ValueError, match="do not cover"):
+        chunk_block_ids([4, 5, 6], 768, 1_536, 2)
+
+
+def test_first_chunk_using_block_reports_earliest_group_match() -> None:
+    sliced = [[13, 13, 13], [0, 0, 3]]
+    assert first_chunk_using_block(sliced, [12_288, 1_536], 1_536, 3, 0) == 0
+    assert first_chunk_using_block([[13, 13, 13], [1, 0, 3]], [12_288, 1_536], 1_536, 3, 0) == 1
+    assert first_chunk_using_block([[13, 13, 13], [1, 2, 3]], [12_288, 1_536], 1_536, 3, 0) is None
+
+
+def test_mark_block_id_skipped_substitutes_only_that_id() -> None:
+    assert mark_block_id_skipped([[13, 13, 13], [0, 0, 3]], 0) == [
+        [13, 13, 13],
+        [SKIPPED_BLOCK_ID, SKIPPED_BLOCK_ID, 3],
     ]

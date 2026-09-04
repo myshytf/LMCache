@@ -57,6 +57,9 @@ from lmcache.v1.distributed.api import (
     CACHE_SALT_MAX_LEN,
 )
 from lmcache.v1.multiprocess.group_view import (
+    chunk_block_ids,
+    first_chunk_using_block,
+    mark_block_id_skipped,
     slice_block_ids_per_group,
     validate_external_chunk_geometry,
 )
@@ -318,6 +321,14 @@ def build_parallel_strategy_from_vllm_config(
         n_servers=n_servers,
         dcp_size=getattr(pc, "decode_context_parallel_size", 1),
     )
+
+
+# vLLM's block pool reserves block id 0 as the placeholder "null block"
+# (``BlockPool.null_block``). Hybrid managers put it in a request's block table
+# wherever the request owns no state, for example the recurrent checkpoint
+# slots before a prefix-cache hit. Its bytes are shared by every KV cache group
+# and must stay zero: it is never a transfer source or destination.
+VLLM_NULL_BLOCK_ID = 0
 
 
 class LMCacheMPRequestState(enum.Enum):
@@ -630,6 +641,44 @@ class LMCacheMPRequestMetadata:
                 end_token_idx,
                 external_chunk_size=lmcache_tokens_per_chunk,
             )
+            # A chunk whose source in any group is the null block holds no
+            # state for that group (a recurrent checkpoint the request never
+            # owned). Objects are keyed as a contiguous prefix, so the store
+            # window ends before the first such chunk instead of persisting
+            # the placeholder bytes as cache content.
+            null_chunk = first_chunk_using_block(
+                block_ids,
+                group_tokens_per_block,
+                lmcache_tokens_per_chunk,
+                num_chunks,
+                VLLM_NULL_BLOCK_ID,
+            )
+            if null_chunk is not None:
+                logger.debug(
+                    "Store for request %s stops before chunk %d: its block in "
+                    "at least one engine group is the null block.",
+                    tracker.request_id,
+                    null_chunk,
+                )
+                if null_chunk == 0:
+                    return None
+                block_ids = [
+                    [
+                        block_id
+                        for chunk_ids in chunk_block_ids(
+                            group_ids,
+                            tokens_per_block,
+                            lmcache_tokens_per_chunk,
+                            num_chunks,
+                        )[:null_chunk]
+                        for block_id in chunk_ids
+                    ]
+                    for group_ids, tokens_per_block in zip(
+                        block_ids, group_tokens_per_block, strict=True
+                    )
+                ]
+                num_chunks = null_chunk
+                end_token_idx = start_token_idx + num_chunks * lmcache_tokens_per_chunk
             token_ids = list(tracker.all_token_ids)
             op = LoadStoreOp(
                 token_ids=token_ids,
@@ -734,6 +783,11 @@ class LMCacheMPRequestMetadata:
                 end_token_idx,
                 external_chunk_size=lmcache_tokens_per_chunk,
             )
+            # A null-block destination means the request owns no state for
+            # that chunk in that group (a recurrent checkpoint it resumes
+            # past). The worker drops those chunks for that group only; the
+            # other groups still load the range.
+            block_ids = mark_block_id_skipped(block_ids, VLLM_NULL_BLOCK_ID)
             token_ids = list(tracker.all_token_ids)
 
             # Compute how many tokens at the start of the retrieve range

@@ -97,6 +97,51 @@ def _collapse_chunks_for_single_destination(
     return chunks[-1:], block_ids[last_start : last_start + blocks_in_chunk]
 
 
+def _drop_skipped_chunks(
+    chunks: list[torch.Tensor],
+    block_ids: list[int],
+    blocks_in_chunk: int,
+) -> tuple[list[torch.Tensor], list[int], int]:
+    """Drop the leading chunks whose destination is marked skipped.
+
+    The request-side connector substitutes a negative manager id for a block
+    that must not be written in one engine group (vLLM's null placeholder
+    block). Those chunks form a prefix of a retrieve range: hybrid managers
+    place placeholders before the block a request resumes from. Dropping them
+    keeps the remaining chunks contiguous, so the projected fine-chunk layout
+    and the object slots stay aligned.
+
+    Args:
+        chunks: CPU objects of the range, one per external chunk.
+        block_ids: Manager ids of the range, ``blocks_in_chunk`` per chunk.
+        blocks_in_chunk: Manager ids per external chunk in this group.
+
+    Returns:
+        ``(chunks, block_ids, dropped)`` for the kept suffix, where ``dropped``
+        is the number of leading chunks removed.
+
+    Raises:
+        ValueError: If a skipped destination follows a kept chunk; only a
+            leading prefix can be dropped without breaking object alignment.
+    """
+    num_chunks = len(chunks)
+    if blocks_in_chunk < 1 or len(block_ids) != num_chunks * blocks_in_chunk:
+        return chunks, block_ids, 0
+    skipped = [
+        any(bid < 0 for bid in block_ids[i * blocks_in_chunk : (i + 1) * blocks_in_chunk])
+        for i in range(num_chunks)
+    ]
+    dropped = 0
+    while dropped < num_chunks and skipped[dropped]:
+        dropped += 1
+    if any(skipped[dropped:]):
+        raise ValueError(
+            "a skipped block destination follows a kept chunk; only leading "
+            f"chunks can be dropped (skip mask {skipped})"
+        )
+    return chunks[dropped:], block_ids[dropped * blocks_in_chunk :], dropped
+
+
 # Helper functions
 def _supports_async_primitives() -> bool:
     """Probe whether the worker device supports the async store primitives.
@@ -1019,15 +1064,22 @@ class EngineDrivenTransferContext(TransferContext):
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
-                scatter_cpu_to_paged_kv(
-                    kv_caches,
-                    _single_group_block_ids(block_ids),
-                    src_buffers,
-                    blocks_in_chunk,
-                    skip_first_n_tokens=skip_first_n_tokens,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
+                src_buffers, single_ids, dropped = _drop_skipped_chunks(
+                    src_buffers, _single_group_block_ids(block_ids), blocks_in_chunk
                 )
+                # The single-group path has no registered chunk geometry; a
+                # dropped prefix can only carry a zero skip.
+                single_skip = 0 if dropped else skip_first_n_tokens
+                if src_buffers:
+                    scatter_cpu_to_paged_kv(
+                        kv_caches,
+                        single_ids,
+                        src_buffers,
+                        blocks_in_chunk,
+                        skip_first_n_tokens=single_skip,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=self._engine_kv_format,
+                    )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False
@@ -1086,9 +1138,16 @@ class EngineDrivenTransferContext(TransferContext):
         key: Any,
         kv_caches: dict[str, torch.Tensor],
         manager_block_ids: list[int],
+        start_token_idx: int | None = None,
     ) -> tuple[dict[str, torch.Tensor], list[int]]:
-        """Build zero-copy views and virtual IDs for one LMCache group."""
+        """Build zero-copy views and virtual IDs for one LMCache group.
+
+        ``start_token_idx`` overrides ``key.start`` when leading chunks of the
+        range were dropped for this group; the id list then covers
+        ``[start_token_idx, key.end)``.
+        """
         group_kv_caches = {name: kv_caches[name] for name in state.layer_names}
+        range_start = key.start if start_token_idx is None else start_token_idx
         geometry_registered = (
             self._external_chunk_size > 0
             and state.logical_tokens_per_block > 0
@@ -1106,10 +1165,10 @@ class EngineDrivenTransferContext(TransferContext):
                 raise RuntimeError("external chunk geometry was not fully registered")
             return group_kv_caches, list(manager_block_ids)
 
-        token_span = key.end - key.start
+        token_span = key.end - range_start
         if token_span < 0 or token_span % self._external_chunk_size:
             raise ValueError(
-                f"token range [{key.start}, {key.end}) does not align to "
+                f"token range [{range_start}, {key.end}) does not align to "
                 f"external chunk size {self._external_chunk_size}"
             )
         expected_block_ids = (
@@ -1117,7 +1176,7 @@ class EngineDrivenTransferContext(TransferContext):
         )
         if len(manager_block_ids) != expected_block_ids:
             raise ValueError(
-                f"token range [{key.start}, {key.end}) requires "
+                f"token range [{range_start}, {key.end}) requires "
                 f"{expected_block_ids} block IDs, got {len(manager_block_ids)}"
             )
         if state.subblocks_per_manager == 1:
@@ -1130,7 +1189,7 @@ class EngineDrivenTransferContext(TransferContext):
         transfer_block_ids, physical_tokens_per_chunk = (
             project_external_chunk_block_ids(
                 manager_block_ids,
-                start_token_idx=key.start,
+                start_token_idx=range_start,
                 external_chunk_size=self._external_chunk_size,
                 logical_tokens_per_block=state.logical_tokens_per_block,
                 physical_tokens_per_block=state.physical_tokens_per_block,
@@ -1266,11 +1325,19 @@ class EngineDrivenTransferContext(TransferContext):
         if group_chunks is not None:
             try:
                 for gid, state in enumerate(self._group_states):
-                    chunks = group_chunks[gid]
-                    transfer_kv_caches, group_block_ids = self._group_transfer_inputs(
-                        state, key, kv_caches, block_ids[gid]
+                    chunks, kept_ids, dropped = _drop_skipped_chunks(
+                        group_chunks[gid], block_ids[gid], state.blocks_in_chunk
                     )
-                    if skip_first_n_tokens == 0:
+                    if not chunks:
+                        continue
+                    group_start = key.start + dropped * self._external_chunk_size
+                    group_skip = max(
+                        0, skip_first_n_tokens - dropped * self._external_chunk_size
+                    )
+                    transfer_kv_caches, group_block_ids = self._group_transfer_inputs(
+                        state, key, kv_caches, kept_ids, start_token_idx=group_start
+                    )
+                    if group_skip == 0:
                         compact_chunks, compact_block_ids = (
                             _collapse_chunks_for_single_destination(
                                 chunks,
@@ -1294,7 +1361,7 @@ class EngineDrivenTransferContext(TransferContext):
                         chunks,
                         state.blocks_in_chunk,
                         skip_first_n_tokens=self._physical_skip_tokens(
-                            state, skip_first_n_tokens
+                            state, group_skip
                         ),
                         layout_hints=self._layout_hints,
                         engine_kv_format=state.engine_kv_format,
@@ -1336,10 +1403,19 @@ class EngineDrivenTransferContext(TransferContext):
             try:
                 for gid, state in enumerate(self._group_states):
                     src_g, _ = self._group_slots(tensors, group_ids, gid)
-                    transfer_kv_caches, group_block_ids = self._group_transfer_inputs(
-                        state, key, kv_caches, block_ids[gid]
+                    src_g, kept_ids, dropped = _drop_skipped_chunks(
+                        src_g, block_ids[gid], state.blocks_in_chunk
                     )
-                    if skip_first_n_tokens == 0:
+                    if not src_g:
+                        continue
+                    group_start = key.start + dropped * self._external_chunk_size
+                    group_skip = max(
+                        0, skip_first_n_tokens - dropped * self._external_chunk_size
+                    )
+                    transfer_kv_caches, group_block_ids = self._group_transfer_inputs(
+                        state, key, kv_caches, kept_ids, start_token_idx=group_start
+                    )
+                    if group_skip == 0:
                         src_g, group_block_ids = (
                             _collapse_chunks_for_single_destination(
                                 src_g,
@@ -1354,7 +1430,7 @@ class EngineDrivenTransferContext(TransferContext):
                         src_g,
                         state.blocks_in_chunk,
                         skip_first_n_tokens=self._physical_skip_tokens(
-                            state, skip_first_n_tokens
+                            state, group_skip
                         ),
                         layout_hints=self._layout_hints,
                         engine_kv_format=state.engine_kv_format,
