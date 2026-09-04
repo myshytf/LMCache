@@ -16,6 +16,7 @@ import pytest
 
 # First Party
 from lmcache.integration.vllm.lmcache_mp_connector import (
+    LMCacheMPConnector,
     LMCacheMPRequestMetadata,
     LMCacheMPRequestState,
     LMCacheMPRequestTracker,
@@ -156,3 +157,151 @@ def test_retrieve_metadata_skip_tokens_preserved_on_emitted_op() -> None:
     assert metadata.op.start == 0
     assert metadata.op.end == CHUNK_TOKENS
     assert metadata.op.skip_first_n_tokens == 16
+
+
+# ---------------------------------------------------------------------------
+# Retrieve range bounded by the scheduler's admitted external tokens.
+# ---------------------------------------------------------------------------
+
+
+def _lookup_tracker(
+    lmcache_hit_tokens: int,
+    vllm_hit_tokens: int,
+) -> LMCacheMPRequestTracker:
+    """Build a tracker as it looks right after ``get_num_new_matched_tokens``."""
+    tracker = _tracker(
+        num_tokens=lmcache_hit_tokens + CHUNK_TOKENS,
+        lmcache_hit_tokens=lmcache_hit_tokens,
+        vllm_hit_tokens=vllm_hit_tokens,
+        allocated_block_ids={0: list(range(8))},
+    )
+    tracker.state = LMCacheMPRequestState.PREFETCHING
+    return tracker
+
+
+def test_retrieve_end_defaults_to_lookup_hit_before_admission() -> None:
+    tracker = _lookup_tracker(3 * CHUNK_TOKENS, 0)
+
+    assert tracker.retrieve_end_token(CHUNK_TOKENS) == 3 * CHUNK_TOKENS
+    assert tracker.needs_retrieve()
+
+
+@pytest.mark.parametrize(
+    ("vllm_hit", "admitted", "expected_end", "expected_needs_retrieve"),
+    [
+        # Scheduler kept a local sub-block tail and admitted nothing.
+        (0, 0, 0, False),
+        # Full lookup hit admitted.
+        (0, 3 * CHUNK_TOKENS, 3 * CHUNK_TOKENS, True),
+        # Partial admission on an object boundary.
+        (0, CHUNK_TOKENS, CHUNK_TOKENS, True),
+        # Non-aligned admission rounds up to the object boundary.
+        (0, CHUNK_TOKENS + 1, 2 * CHUNK_TOKENS, True),
+        # Admission beyond the lookup hit is capped at the hit.
+        (0, 5 * CHUNK_TOKENS, 3 * CHUNK_TOKENS, True),
+        # Local hit plus admitted continuation.
+        (CHUNK_TOKENS, CHUNK_TOKENS, 2 * CHUNK_TOKENS, True),
+        (CHUNK_TOKENS, 0, CHUNK_TOKENS, False),
+    ],
+)
+def test_retrieve_end_bounded_by_admitted_external_tokens(
+    vllm_hit: int,
+    admitted: int,
+    expected_end: int,
+    expected_needs_retrieve: bool,
+) -> None:
+    tracker = _lookup_tracker(3 * CHUNK_TOKENS, vllm_hit)
+
+    tracker.admit_external_tokens(admitted)
+
+    assert tracker.retrieve_end_token(CHUNK_TOKENS) == expected_end
+    assert tracker.needs_retrieve() is expected_needs_retrieve
+
+
+def test_retrieve_metadata_stops_at_admitted_external_range() -> None:
+    tracker = _lookup_tracker(3 * CHUNK_TOKENS, 0)
+    tracker.admit_external_tokens(2 * CHUNK_TOKENS)
+    tracker.state = LMCacheMPRequestState.WAITING_FOR_LOAD
+
+    metadata = LMCacheMPRequestMetadata.GetRetrieveMetadata(tracker, CHUNK_TOKENS, [16])
+
+    assert metadata is not None
+    assert metadata.op.start == 0
+    assert metadata.op.end == 2 * CHUNK_TOKENS
+    assert metadata.op.block_ids == [list(range(8))]
+
+
+class _RecordingSchedulerAdapter:
+    """Scheduler adapter stub recording lock releases."""
+
+    lmcache_tokens_per_chunk = CHUNK_TOKENS
+
+    def __init__(self) -> None:
+        self.freed: list[tuple[int, int]] = []
+        self.cleaned: list[str] = []
+
+    def cleanup_lookup_result(self, request_id: str) -> None:
+        self.cleaned.append(request_id)
+
+    def free_lookup_locks(
+        self,
+        token_ids: list[int],
+        start: int,
+        end: int,
+        request_id: str,
+        cache_salt: str = "",
+    ) -> None:
+        self.freed.append((start, end))
+
+
+def _connector_with_tracker(
+    tracker: LMCacheMPRequestTracker,
+) -> tuple[LMCacheMPConnector, _RecordingSchedulerAdapter]:
+    connector = object.__new__(LMCacheMPConnector)
+    adapter = _RecordingSchedulerAdapter()
+    connector.request_trackers = {tracker.request_id: tracker}
+    connector.scheduler_adapter = adapter
+    return connector, adapter
+
+
+def test_update_state_after_alloc_with_zero_admitted_tokens_skips_retrieve() -> None:
+    """A local sub-block tail kept by the scheduler must not trigger a
+    retrieve that races the forward pass on the same blocks; every lookup
+    lock is released instead."""
+    tracker = _lookup_tracker(3 * CHUNK_TOKENS, 0)
+    connector, adapter = _connector_with_tracker(tracker)
+    request = SimpleNamespace(request_id=tracker.request_id)
+    blocks = SimpleNamespace(get_block_ids=lambda: ([0, 1, 2, 3, 4, 5, 6, 7],))
+
+    connector.update_state_after_alloc(request, blocks, 0)
+
+    assert tracker.state is LMCacheMPRequestState.READY
+    assert not tracker.needs_retrieve()
+    assert adapter.freed == [(0, 3 * CHUNK_TOKENS)]
+    assert adapter.cleaned == [tracker.request_id]
+
+
+def test_update_state_after_alloc_partial_admission_frees_unadmitted_tail() -> None:
+    tracker = _lookup_tracker(3 * CHUNK_TOKENS, 0)
+    connector, adapter = _connector_with_tracker(tracker)
+    request = SimpleNamespace(request_id=tracker.request_id)
+    blocks = SimpleNamespace(get_block_ids=lambda: ([0, 1, 2, 3, 4, 5, 6, 7],))
+
+    connector.update_state_after_alloc(request, blocks, CHUNK_TOKENS)
+
+    assert tracker.state is LMCacheMPRequestState.WAITING_FOR_LOAD
+    assert tracker.retrieve_end_token(CHUNK_TOKENS) == CHUNK_TOKENS
+    assert adapter.freed == [(CHUNK_TOKENS, 3 * CHUNK_TOKENS)]
+
+
+def test_update_state_after_alloc_full_admission_keeps_full_retrieve() -> None:
+    tracker = _lookup_tracker(3 * CHUNK_TOKENS, 0)
+    connector, adapter = _connector_with_tracker(tracker)
+    request = SimpleNamespace(request_id=tracker.request_id)
+    blocks = SimpleNamespace(get_block_ids=lambda: ([0, 1, 2, 3, 4, 5, 6, 7],))
+
+    connector.update_state_after_alloc(request, blocks, 3 * CHUNK_TOKENS)
+
+    assert tracker.state is LMCacheMPRequestState.WAITING_FOR_LOAD
+    assert tracker.retrieve_end_token(CHUNK_TOKENS) == 3 * CHUNK_TOKENS
+    assert adapter.freed == []

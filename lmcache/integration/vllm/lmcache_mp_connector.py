@@ -372,6 +372,10 @@ class LMCacheMPRequestTracker:
     num_vllm_hit_tokens: int = 0
     num_lmcache_hit_tokens: int = 0
     skip_mixed_recurrent_retrieve: bool = False
+    # External tokens the scheduler admitted for this request, reported by
+    # ``update_state_after_alloc``. ``-1`` until the scheduler reports it; the
+    # retrieve range is then bounded by the lookup hit alone.
+    num_admitted_external_tokens: int = -1
 
     # Main state
     state: LMCacheMPRequestState = LMCacheMPRequestState.PREFETCHING
@@ -387,6 +391,7 @@ class LMCacheMPRequestTracker:
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
         self.skip_mixed_recurrent_retrieve = False
+        self.num_admitted_external_tokens = -1
         self.state = LMCacheMPRequestState.PREFETCHING
 
     ####
@@ -397,8 +402,59 @@ class LMCacheMPRequestTracker:
         update_stage_after_alloc"""
         return (
             not self.skip_mixed_recurrent_retrieve
-            and self.num_lmcache_hit_tokens > self.num_vllm_hit_tokens
+            and self.retrieve_end_token(1) > self.num_vllm_hit_tokens
             and self.state != LMCacheMPRequestState.READY
+        )
+
+    def admit_external_tokens(self, num_external_tokens: int) -> None:
+        """Record how many external tokens the scheduler admitted.
+
+        The lookup reports every chunk LMCache can serve past the block-aligned
+        local hit it was shown. The scheduler then decides how many of those
+        tokens it actually loads: it can keep a local sub-block tail the lookup
+        never saw and admit none of them. A retrieve must cover exactly the
+        admitted range, so anything the scheduler did not admit is neither
+        loaded nor kept locked.
+
+        Args:
+            num_external_tokens: External token count passed to
+                ``update_state_after_alloc``; negative values count as zero.
+        """
+        self.num_admitted_external_tokens = max(0, int(num_external_tokens))
+
+    def retrieve_end_token(self, lmcache_tokens_per_chunk: int) -> int:
+        """Return the exclusive end of the range a retrieve may load.
+
+        This is the lookup hit, bounded by the admitted external range rounded
+        up to the object boundary so a non-aligned admission still loads every
+        object the scheduler counted on.
+
+        Args:
+            lmcache_tokens_per_chunk: Tokens represented by one LMCache object.
+
+        Returns:
+            A token index in ``[num_vllm_hit_tokens, num_lmcache_hit_tokens]``
+            when the scheduler has reported its admission, else the lookup hit.
+
+        Raises:
+            ValueError: If ``lmcache_tokens_per_chunk`` is not positive.
+        """
+        if lmcache_tokens_per_chunk <= 0:
+            raise ValueError(
+                "lmcache_tokens_per_chunk must be positive, "
+                f"got {lmcache_tokens_per_chunk}"
+            )
+        if self.num_admitted_external_tokens < 0:
+            return self.num_lmcache_hit_tokens
+        admitted_end = self.num_vllm_hit_tokens + self.num_admitted_external_tokens
+        aligned_end = (
+            (admitted_end + lmcache_tokens_per_chunk - 1)
+            // lmcache_tokens_per_chunk
+            * lmcache_tokens_per_chunk
+        )
+        return max(
+            self.num_vllm_hit_tokens,
+            min(self.num_lmcache_hit_tokens, aligned_end),
         )
 
     def is_ready_for_retrieving(self) -> bool:
@@ -625,7 +681,7 @@ class LMCacheMPRequestMetadata:
             // lmcache_tokens_per_chunk
             * lmcache_tokens_per_chunk
         )
-        end_token_idx = tracker.num_lmcache_hit_tokens
+        end_token_idx = tracker.retrieve_end_token(lmcache_tokens_per_chunk)
         assert end_token_idx % lmcache_tokens_per_chunk == 0, (
             "The number of LMCache hit tokens should be a multiple of the "
             "LMCache chunk size. "
@@ -1317,6 +1373,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.append_block_ids(tuple(new_block_ids))
 
         # Update the state of the tracker
+        if tracker.state == LMCacheMPRequestState.PREFETCHING:
+            # The scheduler saw the lookup result and decided how much of it
+            # to load. Zero means it kept a local prefix (possibly a sub-block
+            # tail the lookup was never shown) and will compute the rest, so
+            # no retrieve may write into blocks the forward is about to use.
+            tracker.admit_external_tokens(num_external_tokens)
         condition = tracker.needs_retrieve()
         if tracker.state == LMCacheMPRequestState.PREFETCHING:
             # If need to retrieve, change to WAITING_FOR_LOAD
@@ -1332,6 +1394,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # Free locks on chunks that vLLM already computed and won't
             # retrieve from LMCache.
             if tracker.num_lmcache_hit_tokens > 0:
+                retrieve_end = tracker.retrieve_end_token(
+                    self.scheduler_adapter.lmcache_tokens_per_chunk
+                )
                 if not condition:
                     # No retrieve needed — free ALL locked chunks
                     free_end = tracker.num_lmcache_hit_tokens
@@ -1356,6 +1421,23 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                         "Free locks of tokens %d-%d since it is cached by vLLM.",
                         0,
                         free_end,
+                    )
+                if condition and retrieve_end < tracker.num_lmcache_hit_tokens:
+                    # Chunks past the admitted range are never retrieved, so
+                    # their lookup locks are released here instead of by the
+                    # retrieve.
+                    self.scheduler_adapter.free_lookup_locks(
+                        token_ids=list(tracker.all_token_ids),
+                        start=retrieve_end,
+                        end=tracker.num_lmcache_hit_tokens,
+                        request_id=request.request_id,
+                        cache_salt=tracker.cache_salt,
+                    )
+                    logger.debug(
+                        "Free locks of tokens %d-%d beyond the admitted "
+                        "external range.",
+                        retrieve_end,
+                        tracker.num_lmcache_hit_tokens,
                     )
 
     def build_connector_meta(
