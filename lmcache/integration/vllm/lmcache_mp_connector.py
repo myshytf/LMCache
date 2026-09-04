@@ -5,7 +5,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import enum
+import hashlib
 import math
+import os
 import sys
 
 # Third Party
@@ -48,8 +50,12 @@ from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
     effective_tokens_per_block,
 )
-from lmcache.integration.vllm.utils import mla_enabled, vllm_layout_hints
+from lmcache.integration.vllm.utils import mla_only, vllm_layout_hints
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.distributed.api import (
+    CACHE_SALT_FORBIDDEN_CHARS,
+    CACHE_SALT_MAX_LEN,
+)
 from lmcache.v1.multiprocess.group_view import (
     slice_block_ids_per_group,
     validate_external_chunk_geometry,
@@ -103,6 +109,77 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+CACHE_NAMESPACE_ENV = "LMCACHE_CACHE_NAMESPACE"
+"""Deployment-wide namespace for every LMCache key this server reads or
+writes. Its value becomes the leading component of each request's
+``cache_salt``, so entries written by a server configured with another
+namespace can never be looked up. The literal ``legacy`` selects the empty
+salt and keeps entries written before namespaces existed reachable."""
+
+CACHE_NAMESPACE_REQUIRED_ENV = "LMCACHE_REQUIRE_CACHE_NAMESPACE"
+"""When ``1``, ``LMCACHE_CACHE_NAMESPACE`` must be set: a server whose
+launcher did not decide a namespace refuses to start instead of sharing keys
+with an unknown configuration."""
+
+CACHE_NAMESPACE_LEGACY = "legacy"
+_CACHE_SALT_MAX_LEN = CACHE_SALT_MAX_LEN
+_CACHE_SALT_FORBIDDEN = CACHE_SALT_FORBIDDEN_CHARS
+
+
+def resolve_cache_namespace() -> str:
+    """Return the cache namespace selected by the environment.
+
+    Returns:
+        The namespace string, or ``""`` for the legacy (unnamespaced) key
+        space.
+
+    Raises:
+        ValueError: The namespace is required but absent, empty, or contains
+            a character ``ObjectKey`` rejects in a cache salt.
+    """
+    required = os.environ.get(CACHE_NAMESPACE_REQUIRED_ENV, "0") == "1"
+    value = os.environ.get(CACHE_NAMESPACE_ENV)
+    if value is None or value == "":
+        if required:
+            raise ValueError(
+                f"{CACHE_NAMESPACE_ENV} is not set but "
+                f"{CACHE_NAMESPACE_REQUIRED_ENV}=1; the launcher must decide "
+                "the cache namespace before starting the engine"
+            )
+        return ""
+    if value == CACHE_NAMESPACE_LEGACY:
+        return ""
+    if _CACHE_SALT_FORBIDDEN & set(value):
+        raise ValueError(f"{CACHE_NAMESPACE_ENV} contains a forbidden character")
+    if len(value) > _CACHE_SALT_MAX_LEN - 2:
+        raise ValueError(f"{CACHE_NAMESPACE_ENV} is too long")
+    return value
+
+
+def compose_cache_salt(namespace: str, request_salt: str | None) -> str:
+    """Combine the server namespace with a request's own cache salt.
+
+    Args:
+        namespace: Value returned by :func:`resolve_cache_namespace`.
+        request_salt: The request's ``cache_salt`` (``None`` or ``""`` when
+            the client sent none).
+
+    Returns:
+        ``request_salt`` (or ``""``) when there is no namespace; otherwise the
+        namespace alone, or ``"<namespace>.<request_salt>"``. A request salt
+        that would push the result past the ``ObjectKey`` limit is replaced
+        by its SHA-256 hex digest so different client salts stay distinct.
+    """
+    request_salt = request_salt or ""
+    if not namespace:
+        return request_salt
+    if not request_salt:
+        return namespace
+    composed = f"{namespace}.{request_salt}"
+    if len(composed) > _CACHE_SALT_MAX_LEN:
+        composed = f"{namespace}.{hashlib.sha256(request_salt.encode()).hexdigest()}"
+    return composed
 
 
 # Helper functions
@@ -193,6 +270,17 @@ def validate_mamba_step_alignment(vllm_config: VllmConfig) -> None:
     if getattr(vllm_config.cache_config, "mamba_cache_mode", "none") != "align":
         return
     block_size = vllm_config.cache_config.block_size
+    # kimi-k3-cadence-step-alignment: align mode snapshots at scheduler-step
+    # ends, and the scheduler splits mid-prefill steps on the RECURRENT
+    # cadence (the Mamba group block, lcm'd in Scheduler.__init__), which
+    # this fork allows to be a whole multiple of the physical attention
+    # block. Steps of one cadence block end exactly on snapshot boundaries,
+    # so the no-skipped-boundary invariant must be checked against the
+    # cadence, not the physical page size. Cadences that are not a whole
+    # multiple of the physical block keep the strict physical-block check.
+    _cadence = getattr(vllm_config.cache_config, "mamba_block_size", None)
+    if _cadence and _cadence % block_size == 0:
+        block_size = _cadence
     max_batched = vllm_config.scheduler_config.max_num_batched_tokens
     if not (block_size <= max_batched < 2 * block_size):
         raise ValueError(
@@ -222,7 +310,7 @@ def build_parallel_strategy_from_vllm_config(
     """
     pc = vllm_config.parallel_config
     return ParallelStrategy(
-        use_mla=mla_enabled(vllm_config.model_config),
+        use_mla=mla_only(vllm_config.model_config),
         vllm_world_size=pc.world_size,
         vllm_worker_id=pc.rank,
         tp_size=pc.tensor_parallel_size,
@@ -242,6 +330,19 @@ class LMCacheMPRequestState(enum.Enum):
     PREFETCHING = enum.auto()
     WAITING_FOR_LOAD = enum.auto()
     READY = enum.auto()
+
+
+def _should_skip_mixed_recurrent_retrieve(
+    has_recurrent_cache: bool,
+    num_computed_tokens: int,
+    num_lmcache_hit_tokens: int,
+) -> bool:
+    """Reject an unqualified external tail spliced onto local recurrent state."""
+    return (
+        has_recurrent_cache
+        and num_computed_tokens > 0
+        and num_lmcache_hit_tokens > num_computed_tokens
+    )
 
 
 @dataclass
@@ -270,20 +371,22 @@ class LMCacheMPRequestTracker:
     # Staging load operation -- save vllm and lmcache hit tokens during lookup
     num_vllm_hit_tokens: int = 0
     num_lmcache_hit_tokens: int = 0
+    skip_mixed_recurrent_retrieve: bool = False
 
     # Main state
     state: LMCacheMPRequestState = LMCacheMPRequestState.PREFETCHING
 
     cache_salt: str = ""
 
-    def __init__(self, request: "Request"):
+    def __init__(self, request: "Request", namespace: str = ""):
         self.request_id = request.request_id
-        self.cache_salt: str = request.cache_salt or ""
+        self.cache_salt: str = compose_cache_salt(namespace, request.cache_salt)
         self.all_token_ids = request.all_token_ids
         self.allocated_block_ids = {}
         self.num_stored_tokens = 0
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
+        self.skip_mixed_recurrent_retrieve = False
         self.state = LMCacheMPRequestState.PREFETCHING
 
     ####
@@ -293,7 +396,8 @@ class LMCacheMPRequestTracker:
         """Check whether the current request needs retrieve, will be used
         update_stage_after_alloc"""
         return (
-            self.num_lmcache_hit_tokens > self.num_vllm_hit_tokens
+            not self.skip_mixed_recurrent_retrieve
+            and self.num_lmcache_hit_tokens > self.num_vllm_hit_tokens
             and self.state != LMCacheMPRequestState.READY
         )
 
@@ -310,6 +414,33 @@ class LMCacheMPRequestTracker:
     ####
     def increase_num_scheduled_tokens(self, num_new_tokens: int):
         self.num_scheduled_tokens += num_new_tokens
+
+    def anchor_num_scheduled_tokens(
+        self, engine_num_computed_tokens: int, num_new_tokens: int
+    ) -> None:
+        """Set the computed-token bound from the scheduler's own count.
+
+        ``engine_num_computed_tokens`` is the request's ``num_computed_tokens``
+        as the scheduler reports it in the scheduler output: it already
+        includes the prefix-cache and external hits and has been rewound for
+        every draft token rejected in earlier steps. After the current step
+        the engine will have computed ``engine_num_computed_tokens +
+        num_new_tokens`` tokens; ``num_scheduled_tokens`` holds that count
+        minus the hit prefix so ``GetStoreMetadata`` can keep adding the
+        larger hit count back. Accumulating the scheduled counts instead
+        (``increase_num_scheduled_tokens``) drifts upward by the number of
+        rejected draft tokens, which only the ``len(all_token_ids)`` bound
+        then keeps out of the store range.
+
+        Args:
+            engine_num_computed_tokens: ``num_computed_tokens`` of the request
+                in the scheduler output for this step.
+            num_new_tokens: tokens scheduled for the request in this step.
+        """
+        hit_tokens = max(self.num_vllm_hit_tokens, self.num_lmcache_hit_tokens)
+        self.num_scheduled_tokens = max(
+            0, engine_num_computed_tokens + num_new_tokens - hit_tokens
+        )
 
     def increase_num_stored_tokens(self, num_new_tokens: int):
         """Increase the number of stored tokens for the current request
@@ -418,6 +549,13 @@ class LMCacheMPRequestMetadata:
             if num_engine_groups > 0
             else 0
         )
+        # ``len(all_token_ids)`` is the safety bound when engine steps overlap
+        # (asynchronous scheduling, pipeline parallelism): the scheduler
+        # appends a sampled token only after the step that verified it,
+        # while ``num_computed_tokens`` (hence ``computed_tokens``) already
+        # counts the placeholders of a step still in flight. A store window
+        # therefore never covers a position whose KV a running or rejected
+        # draft step could still rewrite.
         min_available_tokens = min(
             len(tracker.all_token_ids),
             allocated_tokens,
@@ -573,6 +711,11 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
         self.need_flush_before_forward: bool = False
+        # Retrieves the scheduler expected but could not issue (tracker /
+        # allocation desync): ``(request_id, flat block ids)`` pairs the
+        # worker reports as failed loads so vLLM recomputes instead of
+        # waiting forever for a load that was never submitted.
+        self.suppressed_retrieves: list[tuple[str, list[int]]] = []
 
     def add_request_metadata(self, request_metadata: LMCacheMPRequestMetadata):
         self.requests.append(request_metadata)
@@ -652,6 +795,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         validate_kv_cache_groups(getattr(self, "_kv_cache_config", None))
 
         assert vllm_config.kv_transfer_config is not None
+
+        # Namespacing of every key (lookup, store, retrieve, lock release)
+        # through the request trackers' cache_salt; see CACHE_NAMESPACE_ENV.
+        self._cache_namespace = resolve_cache_namespace()
+        if self._cache_namespace:
+            logger.info("LMCache cache namespace: %s", self._cache_namespace)
 
         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
@@ -862,6 +1011,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         ops = []
         cache_salts = []
 
+        for request_id, flat_block_ids in getattr(
+            metadata, "suppressed_retrieves", []
+        ):
+            self.worker_adapter.fail_retrieve(request_id, flat_block_ids)
         for meta in metadata.requests:
             if meta.direction != "RETRIEVE":
                 continue
@@ -1106,6 +1259,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             * self._hit_alignment_tokens
         )
         tracker.num_lmcache_hit_tokens = ret
+
+        # Hybrid recurrent state is not composable across local APC and a
+        # deeper external tail in this runtime. Keep the external objects
+        # locked only until update_state_after_alloc releases them, then
+        # recompute the tail from the trusted local state.
+        if _should_skip_mixed_recurrent_retrieve(
+            self._has_recurrent_cache,
+            num_computed_tokens,
+            ret,
+        ):
+            tracker.skip_mixed_recurrent_retrieve = True
+            return 0, False
 
         need_to_load = max(0, ret - num_computed_tokens)
         logger.debug(
@@ -1366,6 +1531,20 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if r_metadata is not None:
                 metadata.add_request_metadata(r_metadata)
+            else:
+                # The request is WAITING_FOR_REMOTE_KVS in the scheduler and
+                # only leaves that state through get_finished(); without a
+                # submitted retrieve nothing would ever report it. Hand the
+                # worker its allocated blocks so the load is reported failed
+                # and the scheduler recomputes.
+                flat_block_ids = [
+                    block_id
+                    for group_blocks in request_tracker.allocated_block_ids.values()
+                    for block_id in group_blocks
+                ]
+                metadata.suppressed_retrieves.append(
+                    (request_tracker.request_id, flat_block_ids)
+                )
             request_tracker.state = LMCacheMPRequestState.READY
 
     def _process_new_requests(
@@ -1379,7 +1558,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             request_tracker = self._get_request_tracker(new_request.req_id)
 
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
-            request_tracker.increase_num_scheduled_tokens(num_new_tokens)
+            request_tracker.anchor_num_scheduled_tokens(
+                new_request.num_computed_tokens, num_new_tokens
+            )
 
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
@@ -1405,10 +1586,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             if request_id not in cached_reqs.resumed_req_ids:
                 request_tracker.append_block_ids(new_block_ids)
 
-            # Use the incremental num_scheduled_tokens to
-            # stay consistent with _process_new_requests.
+            # Anchor on the scheduler's num_computed_tokens (rewound for
+            # rejected draft tokens) rather than accumulating scheduled
+            # counts; see anchor_num_scheduled_tokens.
             num_new_tokens = scheduler_output.num_scheduled_tokens[request_id]
-            request_tracker.increase_num_scheduled_tokens(num_new_tokens)
+            request_tracker.anchor_num_scheduled_tokens(
+                cached_reqs.num_computed_tokens[idx], num_new_tokens
+            )
 
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
@@ -1508,7 +1692,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 self.request_trackers.pop(request_id)
 
         if request_id not in self.request_trackers:
-            new_tracker = LMCacheMPRequestTracker(request)
+            new_tracker = LMCacheMPRequestTracker(
+                request, namespace=self._cache_namespace
+            )
             self.request_trackers[request_id] = new_tracker
         return self.request_trackers[request_id]
 
@@ -1517,9 +1703,25 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         Clean up request tracker and associated lookup future for a request.
         This should be called when a request is finished to prevent memory leak.
         """
-        # Clean up request tracker
-        if self.request_trackers.pop(request_id, None):
-            logger.debug(
-                "[KVConnector] Cleaned up request_tracker for request %s",
-                request_id,
-            )
+        tracker = self.request_trackers.pop(request_id, None)
+        if tracker is None:
+            return
+
+        # update_state_after_alloc normally releases lookup state. An abort
+        # can arrive before that method runs, leaving the lookup and its read
+        # locks alive until TTL expiry unless cleanup mirrors the normal path.
+        if tracker.state == LMCacheMPRequestState.PREFETCHING:
+            self.scheduler_adapter.cleanup_lookup_result(request_id)
+            if tracker.num_lmcache_hit_tokens > 0:
+                self.scheduler_adapter.free_lookup_locks(
+                    token_ids=list(tracker.all_token_ids),
+                    start=0,
+                    end=tracker.num_lmcache_hit_tokens,
+                    request_id=request_id,
+                    cache_salt=tracker.cache_salt,
+                )
+
+        logger.debug(
+            "[KVConnector] Cleaned up request_tracker for request %s",
+            request_id,
+        )
