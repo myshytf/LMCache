@@ -486,6 +486,9 @@ class LMCacheMPRequestTracker:
     num_vllm_hit_tokens: int = 0
     num_lmcache_hit_tokens: int = 0
     skip_mixed_recurrent_retrieve: bool = False
+    # The lookup reported presence only (no L2 load, no lock): the hit count
+    # anchors store bookkeeping and there is nothing to retrieve or release.
+    lookup_only: bool = False
     # External tokens the scheduler admitted for this request, reported by
     # ``update_state_after_alloc``. ``-1`` until the scheduler reports it; the
     # retrieve range is then bounded by the lookup hit alone.
@@ -511,6 +514,7 @@ class LMCacheMPRequestTracker:
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
         self.skip_mixed_recurrent_retrieve = False
+        self.lookup_only = False
         self.num_admitted_external_tokens = -1
         self.state = LMCacheMPRequestState.PREFETCHING
 
@@ -1448,10 +1452,21 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             if not lookup_token_ids:
                 return 0, False
 
+        # With hybrid recurrent state, an external tail is never spliced onto
+        # a local prefix (see ``_should_skip_mixed_recurrent_retrieve``), so a
+        # request that already holds a local hit will not retrieve whatever
+        # the lookup finds. Ask for presence only: the L2 index answers
+        # without loading objects into L1 and without holding locks, and the
+        # hit count still anchors the store bookkeeping. A request with no
+        # local hit keeps the loading lookup so cold restores are unchanged.
+        lookup_only = self._has_recurrent_cache and num_computed_tokens > 0
+        tracker.lookup_only = lookup_only
+
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
             token_ids=lookup_token_ids,
             cache_salt=tracker.cache_salt,
+            lookup_only=lookup_only,
         )
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
@@ -1553,8 +1568,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             self.scheduler_adapter.cleanup_lookup_result(request.request_id)
 
             # Free locks on chunks that vLLM already computed and won't
-            # retrieve from LMCache.
-            if tracker.num_lmcache_hit_tokens > 0:
+            # retrieve from LMCache. A lookup-only request holds no lock.
+            if tracker.num_lmcache_hit_tokens > 0 and not tracker.lookup_only:
                 retrieve_end = tracker.retrieve_end_token(
                     self.scheduler_adapter.lmcache_tokens_per_chunk
                 )

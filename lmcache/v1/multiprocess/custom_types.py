@@ -67,6 +67,13 @@ class IPCCacheServerKey:
     # object, a geometry the legacy heuristic cannot represent.
     readers_per_object: int = field(default=0, compare=False)
 
+    # Lookup intent, not part of cache identity. True asks the server to
+    # report the prefix of chunks present in L1 or the L2 index without
+    # loading or locking any object: the sender will not retrieve them and
+    # only needs the hit length to anchor its store bookkeeping. An old
+    # payload without the field decodes as a regular (loading) lookup.
+    lookup_only: bool = field(default=False, compare=False)
+
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
     _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
@@ -128,6 +135,7 @@ class IPCCacheServerKey:
             request_id=self.request_id,
             cache_salt=self.cache_salt,
             readers_per_object=self.readers_per_object,
+            lookup_only=self.lookup_only,
         )
 
 

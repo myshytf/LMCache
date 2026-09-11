@@ -746,6 +746,22 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                     bitmap.set(i)
                                     if lookup_keys is not None:
                                         loaded_keys.append(lookup_keys[i])
+                            missing = num_keys - len(loaded_keys)
+                            if missing:
+                                # The prefetch controller only sees the
+                                # per-key booleans; keep the connector's
+                                # error text with the task so a post-hoc
+                                # reader can tell a vanished file from an
+                                # I/O or buffer failure.
+                                logger.warning(
+                                    "Native L2 load task %d: %d/%d keys not "
+                                    "loaded (ok=%s, error=%r)",
+                                    task_id,
+                                    missing,
+                                    num_keys,
+                                    bool(ok),
+                                    error,
+                                )
                         elif ok:
                             # Fallback for connectors that
                             # do not report per-key results

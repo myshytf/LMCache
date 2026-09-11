@@ -47,10 +47,17 @@ class PrefetchMode(enum.Enum):
     ``WARM`` -- speculative pre-warm with no imminent reader: loaded keys are
     retained and left unpinned (immediately resident and evictable), so a later
     lookup can hit them.
+
+    ``LOOKUP_ONLY`` -- report the contiguous prefix of keys present in L1 or in
+    an L2 index without loading anything and without holding any lock. The
+    caller has already decided that it will not retrieve the objects (for
+    example a hybrid-recurrent engine whose local prefix cannot be composed
+    with an external tail) and only needs the hit length for bookkeeping.
     """
 
     LOOKUP = enum.auto()
     WARM = enum.auto()
+    LOOKUP_ONLY = enum.auto()
 
 
 CACHE_SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
@@ -339,6 +346,11 @@ class PrefetchHandle:
     l2_orig_indices: tuple[int, ...] = ()
     """Original-key index of each key submitted to L2; maps the controller's
     local result bitmap back to original positions."""
+
+    lookup_only: bool = False
+    """True when the task was submitted with ``PrefetchMode.LOOKUP_ONLY``: no
+    key was loaded or locked, so the found bitmap describes presence only and
+    nothing must be released afterwards."""
 
 
 def ipc_key_to_object_keys(

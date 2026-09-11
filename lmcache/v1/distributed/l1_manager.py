@@ -1047,6 +1047,22 @@ class L1Manager:
 
     # Debugging APIs
     @l1_mgr_synchronized
+    def count_readable_prefix(self, keys: list[ObjectKey]) -> int:
+        """Return how many leading keys are present and readable in L1.
+
+        Presence only: no read lock is taken and no TTL is refreshed, so the
+        answer can be stale by the time a caller acts on it. Used by
+        lookup-only prefetches that never retrieve the objects.
+        """
+        count = 0
+        for key in keys:
+            state = self._objects.get(key, None)
+            if state is None or not state.available_for_read():
+                break
+            count += 1
+        return count
+
+    @l1_mgr_synchronized
     def get_object_state(self, key: ObjectKey) -> L1ObjectState | None:
         """Get the internal state of the object with the given key.
 

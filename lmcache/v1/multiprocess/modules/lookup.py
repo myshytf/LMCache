@@ -12,6 +12,7 @@ import time
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
     AttnWindowDesc,
+    PrefetchMode,
     ObjectKey,
     PrefetchHandle,
     ipc_key_to_object_keys,
@@ -107,6 +108,9 @@ class _PrefetchJob:
     # tenant / isolation domain (an empty string means no salt set).
     model_name: str = ""
     cache_salt: str = ""
+    lookup_only: bool = False
+    """True when no handle holds a lock: the job reported presence only, so
+    completion must not release group-local surplus locks."""
 
     def __post_init__(self) -> None:
         if not self.handles:
@@ -321,6 +325,9 @@ class LookupModule:
                 f"same length: {len(layout_descs)} != {attn_desc.num_object_groups}"
             )
         object_keys_by_group = self._object_keys_by_group(key, chunk_hashes)
+        # A lookup-only key reports the present prefix without loading or
+        # locking: the client will not retrieve and will not free locks.
+        mode = PrefetchMode.LOOKUP_ONLY if key.lookup_only else PrefetchMode.LOOKUP
         handles = tuple(
             self._ctx.storage_manager.submit_prefetch_task(
                 list(group_keys),
@@ -330,6 +337,7 @@ class LookupModule:
                 attn_desc=AttnWindowDesc(
                     num_chunks_in_sw=[attn_desc.num_chunks_in_sw[object_group_id]]
                 ),
+                mode=mode,
             )
             for object_group_id, (group_keys, layout_desc) in enumerate(
                 zip(object_keys_by_group, layout_descs, strict=True)
@@ -345,6 +353,7 @@ class LookupModule:
                 extra_count=extra_count,
                 model_name=model_name,
                 cache_salt=key.cache_salt,
+                lookup_only=key.lookup_only,
             )
         )
 
@@ -416,7 +425,8 @@ class LookupModule:
         found_count = min(
             found.count_leading_ones() // job.world_size for found in found_by_group
         )
-        self._release_nonservable_group_results(job, found_by_group, found_count)
+        if not job.lookup_only:
+            self._release_nonservable_group_results(job, found_by_group, found_count)
 
         self._ctx.event_bus.publish(
             Event(

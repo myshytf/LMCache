@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, NoReturn, Protocol
 import enum
 import os
@@ -674,7 +674,7 @@ class LMCacheMPSchedulerAdapter:
         self._pending_lookups: set[str] = set()
         self._finished_lookup_results: dict[str, int] = {}
         self._per_server_hits: dict[str, dict[str, int]] = {}
-        self._lookup_params: dict[str, tuple[list[int], str]] = {}
+        self._lookup_params: dict[str, tuple[list[int], str, bool]] = {}
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
@@ -760,6 +760,7 @@ class LMCacheMPSchedulerAdapter:
         request_id: str,
         token_ids: list[int],
         cache_salt: str = "",
+        lookup_only: bool = False,
     ):
         """
         Submit a new lookup request to LMCache if there is no ongoing request.
@@ -774,6 +775,9 @@ class LMCacheMPSchedulerAdapter:
             token_ids: Token IDs to lookup from LMCache
             cache_salt: Per-user isolation salt. Requests with different
                 cache_salt values produce separate cache entries.
+            lookup_only: Report the present prefix without loading it into L1
+                or locking it. The caller must not retrieve or free locks for
+                such a request; the result only anchors store bookkeeping.
 
         Returns:
             None
@@ -781,7 +785,7 @@ class LMCacheMPSchedulerAdapter:
         Notes:
             This function will have a side-effect: submitting a look up request to
             LMCache, which will essentially 'lock' the KV cache chunks in the LMCache
-            for later retrieve operations.
+            for later retrieve operations (unless ``lookup_only`` is set).
             In the meantime, this function will record the lookup request, and the
             status of the look up request can be checked by `check_lookup_result`.
         """
@@ -805,6 +809,8 @@ class LMCacheMPSchedulerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         ).no_worker_id_version()
+        if lookup_only:
+            key = replace(key, lookup_only=True)
 
         futures: dict[str, MessagingFuture[Any]] = {
             url: send_lmcache_request(
@@ -829,7 +835,7 @@ class LMCacheMPSchedulerAdapter:
                 return
 
         self._pending_lookups.add(request_id)
-        self._lookup_params[request_id] = (token_ids, cache_salt)
+        self._lookup_params[request_id] = (token_ids, cache_salt, lookup_only)
 
     def _free_inconsistent_lookup_locks(
         self,
@@ -849,8 +855,11 @@ class LMCacheMPSchedulerAdapter:
             per_server: Per-server hit chunk counts.
             min_chunks: Minimum hit chunk count across all servers.
         """
-        token_ids_l, cs = self._lookup_params.pop(request_id, (None, None))
-        if token_ids_l is not None:
+        token_ids_l, cs, lookup_only = self._lookup_params.pop(
+            request_id, (None, None, False)
+        )
+        if token_ids_l is not None and not lookup_only:
+            # A lookup-only request holds no lock on any server.
             for url, hit_chunks in per_server.items():
                 if hit_chunks <= min_chunks:
                     continue

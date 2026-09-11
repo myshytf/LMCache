@@ -458,6 +458,36 @@ class StorageManager:
         Returns:
             PrefetchHandle to track the task.
         """
+        if mode is PrefetchMode.LOOKUP_ONLY:
+            # Presence report: count the readable L1 prefix without taking
+            # read locks, then ask the L2 index about the remainder without
+            # loading. The result bitmap is consumed by query_prefetch_status
+            # like any other prefetch; nothing is pinned, so the caller must
+            # not release anything afterwards.
+            hit_count = self._l1_manager.count_readable_prefix(keys)
+            remaining_keys = keys[hit_count:]
+            prefetch_request_id = -1
+            l2_orig_indices: tuple[int, ...] = ()
+            if remaining_keys and not skip_l2 and self._has_l2_adapters():
+                prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
+                    remaining_keys,
+                    layout_desc,
+                    extra_count=0,
+                    attn_desc=attn_desc,
+                    policy=policy,
+                    mode=mode,
+                )
+                l2_orig_indices = tuple(range(hit_count, len(keys)))
+            return PrefetchHandle(
+                prefetch_request_id=prefetch_request_id,
+                external_request_id=external_request_id,
+                l1_found_indices=tuple(range(hit_count)),
+                total_requested_keys=len(keys),
+                submit_time=time.monotonic(),
+                l2_orig_indices=l2_orig_indices,
+                lookup_only=True,
+            )
+
         if mode is PrefetchMode.WARM:
             # Warm path: load all keys, pin none. skip_l2 makes it a no-op.
             prefetch_request_id = -1
@@ -733,11 +763,13 @@ class StorageManager:
             l1_hits = len(handle.l1_found_indices)
             l2_hits = l2_r.popcount() if l2_r is not None else 0
             logger.info(
-                "Prefetch request completed (L1+L2): "
-                "%d/%d retained keys (%d L1, %d L2) in %.1f ms "
+                "%s completed (L1+L2): "
+                "%d/%d %s keys (%d L1, %d L2) in %.1f ms "
                 "(external_request_id=%s, prefetch_request_id=%d)",
+                "Lookup-only request" if handle.lookup_only else "Prefetch request",
                 total_hits,
                 handle.total_requested_keys,
+                "present" if handle.lookup_only else "retained",
                 l1_hits,
                 l2_hits,
                 elapsed_ms,

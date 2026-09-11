@@ -1222,7 +1222,10 @@ class PrefetchController(StorageControllerInterface):
         if request.phase == PrefetchPhase.LOOKUP:
             self._poll_lookup_results(request, phase_adapters)
             if request.all_lookups_done():
-                self._transition_to_load_phase(request)
+                if request.mode is PrefetchMode.LOOKUP_ONLY:
+                    self._finalize_lookup_only(request)
+                else:
+                    self._transition_to_load_phase(request)
         elif request.phase == PrefetchPhase.PLAN_AND_LOAD:
             self._poll_load_results(request, phase_adapters)
             if request.all_loads_done():
@@ -1245,6 +1248,30 @@ class PrefetchController(StorageControllerInterface):
                 continue
             request.lookup_results[adapter_idx] = result
             del request.pending_lookup_tasks[adapter_idx]
+
+    def _finalize_lookup_only(self, request: InFlightPrefetchRequest) -> None:
+        """Complete a ``LOOKUP_ONLY`` request from its index answers.
+
+        The retained set is the policy-trimmed union of the adapters' lookup
+        bitmaps; nothing is loaded into L1, so every lookup lock is released
+        immediately and no read lock is ever taken.
+        """
+        num_keys = len(request.keys)
+        merged_lookup = merge_bitmaps(request.lookup_results.values(), num_keys)
+        retained = build_trim_mask(merged_lookup, num_keys, request.policy)
+        self._unlock_all_lookups(request)
+        prefix_hit_count = retained.count_leading_ones()
+        self._update_lookup_results(request.request_id, prefix_hit_count)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L2_PREFETCH_LOOKUP_COMPLETED,
+                metadata={
+                    "request_id": request.request_id,
+                    "prefix_hit_count": prefix_hit_count,
+                },
+            )
+        )
+        self._complete_request(request.request_id, retained)
 
     def _poll_load_results(
         self,
