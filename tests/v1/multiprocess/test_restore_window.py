@@ -192,6 +192,29 @@ def test_free_lookup_locks_without_a_record_releases_the_whole_range():
     assert len(released) == 10 * 2 * 2
 
 
+def test_free_lookup_locks_for_a_worker_key_releases_the_exact_range():
+    # A worker releases what it read-locked itself: a restore window it loaded
+    # past the pinned prefix, or the pinned tail it will not retrieve. Neither
+    # range is clipped to the pinned prefix, which bounds lookup keys only.
+    module, ctx = _module(pin_limit_chunks=3)
+    module._pinned_chunk_end["req-1"] = 3
+
+    # Window [12, 28) = chunks 3..6, all past the pinned prefix.
+    module.free_lookup_locks(_key(worker_id=1, start=12, end=28), tp_size=1)
+
+    args = ctx.token_hasher.compute_chunk_hashes.call_args
+    assert args.kwargs["start"] == 12 and args.kwargs["end"] == 28
+    released = ctx.storage_manager.finish_read_prefetched.call_args.args[0]
+    assert len(released) == 4 * 2  # chunks x groups, this rank only
+    assert len({k.kv_rank for k in released}) == 1
+
+    # The pinned tail [8, 12) = chunk 2 is released the same way.
+    ctx.storage_manager.finish_read_prefetched.reset_mock()
+    module.free_lookup_locks(_key(worker_id=1, start=8, end=12), tp_size=1)
+    released = ctx.storage_manager.finish_read_prefetched.call_args.args[0]
+    assert len(released) == 1 * 2
+
+
 def test_restore_window_is_unknown_without_a_lookup_record():
     module, ctx = _module(pin_limit_chunks=3)
     response = module.restore_window(_key(worker_id=1, start=0, end=8), tp_size=1)
