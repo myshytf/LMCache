@@ -543,13 +543,20 @@ class LookupModule:
             tp_size: Tensor-parallel size for MLA
                 multi-reader locking.
         """
-        # Chunks past the pinned prefix were reported from the L2 index and
-        # hold no lock; releasing them would only log spurious lock errors.
         end = key.end
-        with self._prefetch_job_lock:
-            pinned_chunk_end = self._pinned_chunk_end.get(key.request_id)
-        if pinned_chunk_end is not None:
-            end = min(end, pinned_chunk_end * self._ctx.chunk_size)
+        if key.worker_id is None:
+            # A lookup key names the whole looked-up prefix. Chunks past the
+            # pinned prefix were reported from the L2 index and hold no lock;
+            # releasing them would only log spurious lock errors.
+            with self._prefetch_job_lock:
+                pinned_chunk_end = self._pinned_chunk_end.get(key.request_id)
+            if pinned_chunk_end is not None:
+                end = min(end, pinned_chunk_end * self._ctx.chunk_size)
+        # A worker key names a range this rank read-locked itself: a restore
+        # window it loaded (``restore_window`` locks past the pinned prefix)
+        # or the part of the pinned prefix it will not retrieve. Its bounds
+        # are exact and must not be clipped, or the window locks leak and the
+        # chunks can never be evicted.
         if end <= key.start:
             return
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
