@@ -72,14 +72,15 @@ def _tracker(
 @pytest.mark.parametrize(
     ("group_tokens_per_block", "allocated_block_ids", "expected_block_ids"),
     [
+        # Real pages start at 1; block 0 denotes an absent recurrent checkpoint.
         # Single group, plain geometry: 64 tokens / 16 tokens per block.
-        ([16], {0: [0, 1, 2, 3]}, [[0, 1, 2, 3]]),
+        ([16], {0: [1, 2, 3, 4]}, [[1, 2, 3, 4]]),
         # Single group, DCP-scaled: one manager block id covers 64 tokens.
         ([64], {0: [5]}, [[5]]),
         # Hybrid geometries: each group sliced by its own tokens-per-block.
-        ([16, 32], {0: [0, 1, 2, 3], 1: [10, 11]}, [[0, 1, 2, 3], [10, 11]]),
+        ([16, 32], {0: [1, 2, 3, 4], 1: [10, 11]}, [[1, 2, 3, 4], [10, 11]]),
         # Extra allocated blocks beyond the range are fine (and not emitted).
-        ([16], {0: [0, 1, 2, 3, 4, 5]}, [[0, 1, 2, 3]]),
+        ([16], {0: [1, 2, 3, 4, 5, 6]}, [[1, 2, 3, 4]]),
     ],
 )
 def test_retrieve_metadata_emitted_when_allocation_covers_range(
