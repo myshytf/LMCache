@@ -1438,6 +1438,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             into account.
         """
         tracker = self._get_or_create_request_tracker(request)
+        # Admission emits at most one retrieve. After a failed load the
+        # scheduler may rewind to zero and ask again, but READY cannot emit
+        # another retrieve. Returning a hit here would strand the request in
+        # WAITING_FOR_REMOTE_KVS. Recompute using the scheduler's valid prefix.
+        if tracker.state != LMCacheMPRequestState.PREFETCHING:
+            return 0, False
+        if getattr(request, "skip_reading_prefix_cache", False):
+            return 0, False
         # TODO: support loading KV for preempted requests in the future
         if request.status == RequestStatus.PREEMPTED:
             return 0, False
@@ -1534,19 +1542,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         #   1st call: blocks = initial allocation (APC + fresh)
         #   2nd call: blocks = all blocks
         #  (initial + newly allocated for remaining tokens)
-        # We must only append the NEW blocks beyond what's already tracked
-        # to avoid duplication, which would corrupt the store path's block indexing.
+        # Replace the snapshot to avoid both duplicate IDs on the second call
+        # and stale IDs when failure recovery replaces the initial allocation.
         tracker = self._get_request_tracker(request.request_id)
         block_ids = blocks.get_block_ids() or ()
 
-        # Only append blocks beyond what's already tracked, per engine group.
-        existing_counts = tracker.num_allocated_blocks()
-        new_block_ids: list[list[int]] = []
-        for engine_group_idx, group_blocks in enumerate(block_ids):
-            existing = existing_counts.get(engine_group_idx, 0)
-            new_block_ids.append(list(group_blocks[existing:]))
-        if any(new_block_ids):
-            tracker.append_block_ids(tuple(new_block_ids))
+        # This is the complete allocation, including replacement pages after
+        # a failed restore. Counts alone cannot distinguish old and new pages.
+        tracker.allocated_block_ids = {
+            group: list(ids) for group, ids in enumerate(block_ids) if ids
+        }
 
         # Update the state of the tracker
         if tracker.state == LMCacheMPRequestState.PREFETCHING:
@@ -1651,7 +1656,25 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
-        return
+        invalid = connector_output.invalid_block_ids
+        if not invalid:
+            return
+        for tracker in self.request_trackers.values():
+            if not any(
+                block_id in invalid
+                for blocks in tracker.allocated_block_ids.values()
+                for block_id in blocks
+            ):
+                continue
+            # A failed external hit is not computed KV. Reset the store bound
+            # before local recomputation, otherwise a short prefill can publish
+            # pages past its computed endpoint. Keep page ownership until every
+            # worker completes; the scheduler supplies the next allocation.
+            tracker.num_lmcache_hit_tokens = 0
+            tracker.num_vllm_hit_tokens = 0
+            tracker.num_stored_tokens = 0
+            tracker.num_scheduled_tokens = 0
+            tracker.num_admitted_external_tokens = 0
 
     def request_finished(
         self,

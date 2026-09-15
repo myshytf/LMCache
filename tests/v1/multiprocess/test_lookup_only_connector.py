@@ -19,9 +19,11 @@ import pytest
 # First Party
 from lmcache.integration.vllm.lmcache_mp_connector import (
     LMCacheMPConnector,
+    LMCacheMPRequestMetadata,
     LMCacheMPRequestState,
     LMCacheMPRequestTracker,
 )
+from vllm.v1.outputs import KVConnectorOutput
 
 CHUNK = 4608
 
@@ -122,3 +124,53 @@ def test_loading_tracker_still_frees_locks_it_holds():
     free = connector.scheduler_adapter.free_lookup_locks
     free.assert_called_once()
     assert free.call_args.kwargs["end"] == 4 * CHUNK
+
+
+@pytest.mark.parametrize(
+    "state", [LMCacheMPRequestState.WAITING_FOR_LOAD, LMCacheMPRequestState.READY]
+)
+def test_admitted_request_cannot_enter_a_second_async_load(state) -> None:
+    """A recomputed request must not wait for a retrieve that is never emitted."""
+    tracker = _tracker(num_tokens=5 * CHUNK + 100)
+    tracker.state = state
+    connector = _connector(tracker, lookup_result=4 * CHUNK)
+
+    assert connector.get_num_new_matched_tokens(_request(), 0) == (0, False)
+    connector.scheduler_adapter.maybe_submit_lookup_request.assert_not_called()
+
+
+def test_failed_restore_recomputes_and_stores_only_current_blocks() -> None:
+    """Freed restore pages and uncomputed hit tokens cannot enter a new store."""
+    tracker = _tracker(num_tokens=5 * CHUNK + 100)
+    tracker.state = LMCacheMPRequestState.READY
+    tracker.allocated_block_ids = {0: [10, 11, 12, 13]}
+    tracker.num_lmcache_hit_tokens = tracker.num_stored_tokens = 4 * CHUNK
+    tracker.num_admitted_external_tokens = 4 * CHUNK
+    connector = _connector(tracker, lookup_result=4 * CHUNK)
+
+    connector.update_connector_output(KVConnectorOutput(invalid_block_ids={12}))
+    # All workers still own their pages until the scheduler receives completion.
+    assert tracker.allocated_block_ids == {0: [10, 11, 12, 13]}
+    assert connector.get_num_new_matched_tokens(_request(), 0) == (0, False)
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = ([20],)
+    connector.update_state_after_alloc(_request(), blocks, 0)
+    tracker.anchor_num_scheduled_tokens(0, CHUNK)
+
+    store = LMCacheMPRequestMetadata.GetStoreMetadata(tracker, CHUNK, [CHUNK])
+    assert store is not None
+    assert (store.op.start, store.op.end) == (0, CHUNK)
+    assert store.op.block_ids == [[20]]
+    assert tracker.num_lmcache_hit_tokens == 0
+
+
+def test_unrelated_failure_preserves_successful_restore_bookkeeping() -> None:
+    tracker = _tracker(num_tokens=5 * CHUNK + 100)
+    tracker.state = LMCacheMPRequestState.READY
+    tracker.allocated_block_ids = {0: [10, 11]}
+    tracker.num_lmcache_hit_tokens = tracker.num_stored_tokens = 2 * CHUNK
+    connector = _connector(tracker, lookup_result=2 * CHUNK)
+
+    connector.update_connector_output(KVConnectorOutput(invalid_block_ids={99}))
+
+    assert tracker.num_lmcache_hit_tokens == tracker.num_stored_tokens == 2 * CHUNK

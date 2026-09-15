@@ -14,9 +14,14 @@ from unittest.mock import MagicMock
 import threading
 import time
 
+# Third Party
+import pytest
+
 # First Party
 from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import ObjectKey, PrefetchHandle, PrefetchMode
+from lmcache.v1.distributed.l1_manager import L1Error
+from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.lookup import LookupModule, _PrefetchJob
 from lmcache.v1.multiprocess.protocol import (
@@ -71,7 +76,9 @@ def _module(pin_limit_chunks: int = 0) -> tuple[LookupModule, MagicMock]:
     ctx.token_hasher.compute_chunk_hashes.side_effect = (
         lambda token_ids, prefix_hash=None, start=0, end=None: [
             ObjectKey.IntHash2Bytes(c)
-            for c in range(start // CHUNK, (len(token_ids) if end is None else end) // CHUNK)
+            for c in range(
+                start // CHUNK, (len(token_ids) if end is None else end) // CHUNK
+            )
         ]
     )
     ctx.layout_desc_registry.find_object_group_layouts.return_value = [
@@ -222,14 +229,74 @@ def test_restore_window_is_unknown_without_a_lookup_record():
     ctx.storage_manager.submit_prefetch_task.assert_not_called()
 
 
+@pytest.mark.parametrize("missing_chunk, expected", [(None, 4), (2, 1)])
+def test_window_combines_disk_head_with_resident_memory_tail(
+    missing_chunk: int | None, expected: int
+) -> None:
+    """A resident object after an L1 miss must not be reallocated by L2."""
+    module, ctx = _module(pin_limit_chunks=1)
+    module._pinned_chunk_end["req-1"] = 1
+    # Use the real storage-manager merge with lightweight storage backends.
+    sm = object.__new__(StorageManager)
+    sm._event_bus = MagicMock()
+    sm._adapters_lock = threading.Lock()
+    sm._split_results_lock = threading.Lock()
+    sm._split_head_results = {}
+    sm._l2_adapters = {0: MagicMock()}
+    sm._l1_manager = MagicMock()
+    sm._prefetch_controller = MagicMock()
+    results = {}
+    resident_hashes = {ObjectKey.IntHash2Bytes(c) for c in (3, 4)}
+
+    def read(keys, extra_count=0):
+        return {
+            key: (L1Error.SUCCESS, object())
+            for key in keys
+            if key.chunk_hash in resident_hashes
+        }
+
+    def load(keys, layout, **kwargs):
+        # "new" write reservation cannot overwrite objects already in L1.
+        bitmap = Bitmap(len(keys))
+        bitmap.batched_set(
+            [
+                i
+                for i, key in enumerate(keys)
+                if key.chunk_hash not in resident_hashes
+                and (
+                    missing_chunk is None
+                    or key.chunk_hash != ObjectKey.IntHash2Bytes(missing_chunk)
+                )
+            ]
+        )
+        job_id = len(results) + 1
+        results[job_id] = bitmap
+        return job_id
+
+    sm._l1_manager.reserve_read.side_effect = read
+    sm._prefetch_controller.submit_prefetch_request.side_effect = load
+    sm._prefetch_controller.query_prefetch_result.side_effect = results.pop
+    ctx.storage_manager = sm
+
+    response = module.restore_window(_key(worker_id=1, start=4, end=20), tp_size=1)
+    assert module.query_prefetch_status(response.job_id) == expected
+    if missing_chunk is None:
+        sm._l1_manager.finish_read.assert_not_called()
+    else:
+        # A real hole is a miss; resident suffix objects cannot extend a prefix.
+        released = sm._l1_manager.finish_read.call_args.args[0]
+        assert len(released) == 4  # two suffix objects per group
+        assert all(key.chunk_hash in resident_hashes for key in released)
+    for call in sm._prefetch_controller.submit_prefetch_request.call_args_list:
+        assert not any(key.chunk_hash in resident_hashes for key in call.args[0])
+
+
 def test_restore_window_skips_the_pinned_prefix_and_loads_the_rest():
     module, ctx = _module(pin_limit_chunks=3)
     module._pinned_chunk_end["req-1"] = 3
     ctx.storage_manager.submit_prefetch_task.return_value = _handle(-1, 2)
 
-    fully_pinned = module.restore_window(
-        _key(worker_id=1, start=0, end=8), tp_size=1
-    )
+    fully_pinned = module.restore_window(_key(worker_id=1, start=0, end=8), tp_size=1)
     assert fully_pinned == RestoreWindowResponse(
         known=True, pinned_chunk_end=3, submitted_chunks=0
     )

@@ -15,6 +15,7 @@ from lmcache.v1.distributed.api import (
     PrefetchMode,
     ObjectKey,
     PrefetchHandle,
+    TrimPolicy,
     ipc_key_to_object_keys,
 )
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -720,6 +721,12 @@ class LookupModule:
                 layout_desc,
                 extra_count=extra_count,
                 external_request_id=job_id,
+                # A window may mix L1 hits and L2 misses in any order. Retain
+                # resident objects after a miss; trying to load those objects
+                # again fails the L1 "new" write reservation. The status path
+                # still returns only the common contiguous prefix and releases
+                # every group's surplus locks.
+                policy=TrimPolicy.SPARSE,
                 attn_desc=AttnWindowDesc(
                     num_chunks_in_sw=[attn_desc.num_chunks_in_sw[object_group_id]]
                 ),
