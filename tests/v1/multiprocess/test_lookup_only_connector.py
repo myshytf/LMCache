@@ -39,6 +39,8 @@ def _tracker(num_tokens: int) -> LMCacheMPRequestTracker:
     tracker.num_lmcache_hit_tokens = 0
     tracker.skip_mixed_recurrent_retrieve = False
     tracker.lookup_only = False
+    tracker.lookup_submitted = False
+    tracker.lookup_reissued = False
     tracker.num_admitted_external_tokens = -1
     tracker.state = LMCacheMPRequestState.PREFETCHING
     return tracker
@@ -174,3 +176,87 @@ def test_unrelated_failure_preserves_successful_restore_bookkeeping() -> None:
     connector.update_connector_output(KVConnectorOutput(invalid_block_ids={99}))
 
     assert tracker.num_lmcache_hit_tokens == tracker.num_stored_tokens == 2 * CHUNK
+
+
+def test_lookup_kind_is_fixed_while_the_result_is_pending():
+    """The first call decides the kind; a later re-query with a different
+    local hit neither resubmits nor flips the tracker."""
+    tracker = _tracker(num_tokens=5 * CHUNK + 100)
+    connector = _connector(tracker, lookup_result=None)
+
+    assert connector.get_num_new_matched_tokens(_request(), CHUNK) == (None, True)
+    assert tracker.lookup_only is True
+    assert tracker.lookup_submitted is True
+
+    assert connector.get_num_new_matched_tokens(_request(), 0) == (None, True)
+
+    submit = connector.scheduler_adapter.maybe_submit_lookup_request
+    assert [c.kwargs["lookup_only"] for c in submit.call_args_list] == [True, True]
+    assert tracker.lookup_only is True
+    connector.scheduler_adapter.cleanup_lookup_result.assert_not_called()
+
+
+def test_presence_only_job_is_reissued_as_loading_when_the_local_hit_vanishes():
+    """A request whose local prefix was evicted while its presence-only
+    lookup was pending must not admit that report as loadable: the report is
+    consumed and a loading lookup is issued in its place."""
+    tracker = _tracker(num_tokens=50 * CHUNK + 100)
+    connector = _connector(tracker, lookup_result=None)
+    assert connector.get_num_new_matched_tokens(_request(), CHUNK) == (None, True)
+
+    adapter = connector.scheduler_adapter
+    # Presence report arrives; the loading lookup is still pending.
+    adapter.check_lookup_result.side_effect = [46 * CHUNK, None]
+    assert connector.get_num_new_matched_tokens(_request(), 0) == (None, True)
+
+    adapter.cleanup_lookup_result.assert_called_once_with("req-1")
+    # Submission is idempotent while a lookup is pending: the re-query repeats
+    # the presence-only kind, then the loading lookup replaces it.
+    kinds = [c.kwargs["lookup_only"] for c in adapter.maybe_submit_lookup_request.call_args_list]
+    assert kinds == [True, True, False]
+    assert tracker.lookup_only is False
+    assert tracker.lookup_reissued is True
+    # Nothing anchored on the consumed presence report.
+    assert tracker.num_stored_tokens == 0
+
+    # The loading lookup resolves: the prefix is admitted for restore.
+    adapter.check_lookup_result.side_effect = None
+    adapter.check_lookup_result.return_value = 46 * CHUNK
+    assert connector.get_num_new_matched_tokens(_request(), 0) == (46 * CHUNK, True)
+    assert tracker.num_stored_tokens == 46 * CHUNK
+    assert tracker.num_lmcache_hit_tokens == 46 * CHUNK
+    assert tracker.skip_mixed_recurrent_retrieve is False
+    # Only one re-issue ever happens; the final re-query repeats the loading kind.
+    kinds = [c.kwargs["lookup_only"] for c in adapter.maybe_submit_lookup_request.call_args_list]
+    assert kinds == [True, True, False, False]
+    assert adapter.cleanup_lookup_result.call_count == 1
+
+
+def test_presence_only_report_with_a_local_hit_is_not_reissued():
+    tracker = _tracker(num_tokens=5 * CHUNK + 100)
+    connector = _connector(tracker, lookup_result=4 * CHUNK)
+
+    assert connector.get_num_new_matched_tokens(_request(), CHUNK) == (0, False)
+
+    assert tracker.lookup_only is True
+    assert tracker.lookup_reissued is False
+    connector.scheduler_adapter.cleanup_lookup_result.assert_not_called()
+    assert tracker.num_stored_tokens == 4 * CHUNK
+
+
+def test_reissued_loading_lookup_with_a_returned_local_hit_recomputes_the_tail():
+    """If the local prefix reappears after the re-issue, the loading lookup's
+    result follows the normal mixed-recurrent rule and its locks are freed
+    later by update_state_after_alloc (the tracker is no longer lookup-only)."""
+    tracker = _tracker(num_tokens=50 * CHUNK + 100)
+    connector = _connector(tracker, lookup_result=None)
+    assert connector.get_num_new_matched_tokens(_request(), CHUNK) == (None, True)
+    adapter = connector.scheduler_adapter
+    adapter.check_lookup_result.side_effect = [46 * CHUNK, None]
+    assert connector.get_num_new_matched_tokens(_request(), 0) == (None, True)
+
+    adapter.check_lookup_result.side_effect = None
+    adapter.check_lookup_result.return_value = 46 * CHUNK
+    assert connector.get_num_new_matched_tokens(_request(), CHUNK) == (0, False)
+    assert tracker.lookup_only is False
+    assert tracker.skip_mixed_recurrent_retrieve is True

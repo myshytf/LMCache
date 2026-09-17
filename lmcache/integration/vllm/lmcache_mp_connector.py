@@ -489,6 +489,13 @@ class LMCacheMPRequestTracker:
     # The lookup reported presence only (no L2 load, no lock): the hit count
     # anchors store bookkeeping and there is nothing to retrieve or release.
     lookup_only: bool = False
+    # The lookup kind is decided once, when the lookup is first submitted, and
+    # kept while the scheduler re-queries the pending result: the server-side
+    # job is either presence-only or loading and cannot change afterwards.
+    lookup_submitted: bool = False
+    # A presence-only job was replaced by one loading lookup because the local
+    # prefix that justified it disappeared before admission. At most once.
+    lookup_reissued: bool = False
     # External tokens the scheduler admitted for this request, reported by
     # ``update_state_after_alloc``. ``-1`` until the scheduler reports it; the
     # retrieve range is then bounded by the lookup hit alone.
@@ -1467,8 +1474,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # without loading objects into L1 and without holding locks, and the
         # hit count still anchors the store bookkeeping. A request with no
         # local hit keeps the loading lookup so cold restores are unchanged.
-        lookup_only = self._has_recurrent_cache and num_computed_tokens > 0
-        tracker.lookup_only = lookup_only
+        #
+        # The kind is fixed at submission. The scheduler recomputes the local
+        # hit on every re-query while the lookup is pending, and the blocks
+        # behind that hit can be evicted meanwhile; re-deriving the kind from
+        # a later ``num_computed_tokens`` would let a presence-only job (no
+        # pinned prefix, no lock) be admitted as loadable, and its windowed
+        # restore then fails at once and the whole prefix is recomputed.
+        if getattr(tracker, "lookup_submitted", False):
+            lookup_only = tracker.lookup_only
+        else:
+            lookup_only = self._has_recurrent_cache and num_computed_tokens > 0
+            tracker.lookup_only = lookup_only
+            tracker.lookup_submitted = True
 
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
@@ -1480,6 +1498,37 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
         if ret is None:
             return None, True
+
+        if (
+            ret > 0
+            and tracker.lookup_only
+            and num_computed_tokens == 0
+            and not getattr(tracker, "lookup_reissued", False)
+        ):
+            # The local prefix that justified the presence-only lookup was
+            # evicted before admission. The presence report is consumed and
+            # one loading lookup replaces it, so the prefix the report found
+            # is restored through the pinned head and restore windows instead
+            # of being recomputed. Store bookkeeping is anchored once, below,
+            # on the loading lookup's result.
+            tracker.lookup_reissued = True
+            tracker.lookup_only = False
+            self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+            self.scheduler_adapter.maybe_submit_lookup_request(
+                request.request_id,
+                token_ids=lookup_token_ids,
+                cache_salt=tracker.cache_salt,
+                lookup_only=False,
+            )
+            logger.info(
+                "Request %s: presence-only lookup (%d tokens present) re-issued "
+                "as a loading lookup because its local prefix was evicted",
+                request.request_id,
+                ret,
+            )
+            ret = self.scheduler_adapter.check_lookup_result(request.request_id)
+            if ret is None:
+                return None, True
 
         if ret == 0:
             return 0, False

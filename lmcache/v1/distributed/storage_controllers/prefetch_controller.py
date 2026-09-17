@@ -187,6 +187,12 @@ class InFlightPrefetchRequest:
     # Load phase: keys that were write-reserved in L1
     write_reserved_keys: list[ObjectKey] = field(default_factory=list)
     write_reserved_objs: dict[ObjectKey, "MemoryObj"] = field(default_factory=dict)
+    # Load phase: keys of the plan that were already resident in L1 when the
+    # write reservation ran. They are served in place: read-locked with the
+    # request's ``extra_count`` under ``LOOKUP`` (so the reader releases them
+    # exactly like loaded keys) and untouched under ``WARM``. Nothing is
+    # loaded for them and they never count as failed loads.
+    l1_resident_keys: list[ObjectKey] = field(default_factory=list)
 
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
@@ -955,14 +961,24 @@ class PrefetchController(StorageControllerInterface):
                 request, keys_to_reserve, retentions, write_results
             )
 
-        # Step 4: filter to successfully reserved keys
+        # Step 4: filter to successfully reserved keys. A key the L2 lookup
+        # found but that is already resident in L1 cannot be write-reserved
+        # (``mode="new"``); the storage manager forwards such keys whenever a
+        # readable L1 prefix ends before them (per-key eviction and per-reader
+        # lock release leave chunks partially resident). Treating them as
+        # failures would break the reserved prefix at the first resident key
+        # and drop every later key, so they are served in place instead.
         reserved_key_set: set[ObjectKey] = set()
         oom_keys: list[ObjectKey] = []
+        resident_candidates: list[ObjectKey] = []
+        unavailable_resident: list[ObjectKey] = []
         for key, (err, mem_obj) in write_results.items():
             if err == L1Error.SUCCESS and mem_obj is not None:
                 request.write_reserved_keys.append(key)
                 request.write_reserved_objs[key] = mem_obj
                 reserved_key_set.add(key)
+            elif err == L1Error.KEY_NOT_WRITABLE:
+                resident_candidates.append(key)
             else:
                 if err == L1Error.OUT_OF_MEMORY:
                     oom_keys.append(key)
@@ -972,6 +988,41 @@ class PrefetchController(StorageControllerInterface):
                     key,
                     err,
                 )
+        if resident_candidates:
+            if request.mode is PrefetchMode.WARM:
+                # WARM pins nothing: a resident key is simply present.
+                request.l1_resident_keys.extend(resident_candidates)
+                reserved_key_set.update(resident_candidates)
+            else:
+                read_results = l1_mgr.reserve_read(
+                    resident_candidates, extra_count=request.extra_count
+                )
+                for key in resident_candidates:
+                    read_err, read_obj = read_results.get(
+                        key, (L1Error.KEY_NOT_EXIST, None)
+                    )
+                    if read_err == L1Error.SUCCESS and read_obj is not None:
+                        request.l1_resident_keys.append(key)
+                        reserved_key_set.add(key)
+                    else:
+                        # Resident but not readable (a write is still
+                        # pending): the prefix stops here like any
+                        # unavailable key.
+                        unavailable_resident.append(key)
+        if request.l1_resident_keys:
+            logger.debug(
+                "Prefetch request %d: %d/%d plan keys served from L1 in place",
+                request.request_id,
+                len(request.l1_resident_keys),
+                len(keys_to_reserve),
+            )
+        if unavailable_resident:
+            logger.info(
+                "Prefetch request %d: %d plan keys resident in L1 but not yet "
+                "readable; the served prefix stops before them",
+                request.request_id,
+                len(unavailable_resident),
+            )
 
         if oom_keys:
             self._event_bus.publish(
@@ -987,35 +1038,49 @@ class PrefetchController(StorageControllerInterface):
                 )
             )
 
-        # Step 5: recompute load plan excluding failed reservations
+        # Step 5: recompute load plan excluding failed reservations. Resident
+        # keys count towards the retained prefix but are removed from the
+        # load plan: nothing is transferred for them.
         reserved_bitmap = Bitmap(num_keys)
+        resident_set = set(request.l1_resident_keys)
+        resident_bitmap = Bitmap(num_keys)
         for i, key in enumerate(request.keys):
             if key in reserved_key_set:
                 reserved_bitmap.set(i)
+            if key in resident_set:
+                resident_bitmap.set(i)
 
         retained = build_trim_mask(reserved_bitmap, num_keys, request.policy)
-        trimmed_plan = trim_load_plan_with_mask(load_plan, retained)
+        trimmed_plan = trim_load_plan_with_mask(load_plan, retained & (~resident_bitmap))
         request.load_plan = trimmed_plan
 
         ## Step 6: phase 1 unlock — keys locked in lookup but not in plan
         self._unlock_unneeded_keys(request)
 
         if not trimmed_plan:
-            # Nothing loadable after filtering
+            # Nothing to transfer: either nothing loadable after filtering, or
+            # every retained key is resident in L1. Write reservations cannot
+            # be inside the retained prefix here (they would be in the plan),
+            # so they are released; resident keys outside the retained set
+            # give their read locks back.
             if request.write_reserved_keys:
                 l1_mgr.finish_write(request.write_reserved_keys)
                 l1_mgr.delete(request.write_reserved_keys)
-            self._update_lookup_results(request.request_id, 0)
+            released_resident = (resident_bitmap & (~retained)).gather(request.keys)
+            if released_resident and request.mode is not PrefetchMode.WARM:
+                l1_mgr.finish_read(released_resident, extra_count=request.extra_count)
+            prefix_hit_count = retained.count_leading_ones()
+            self._update_lookup_results(request.request_id, prefix_hit_count)
             self._event_bus.publish(
                 Event(
                     event_type=EventType.L2_PREFETCH_LOOKUP_COMPLETED,
                     metadata={
                         "request_id": request.request_id,
-                        "prefix_hit_count": 0,
+                        "prefix_hit_count": prefix_hit_count,
                     },
                 )
             )
-            self._complete_request(request.request_id, Bitmap(num_keys))
+            self._complete_request(request.request_id, retained)
             return
 
         ## Step 7: submit load tasks per adapter
@@ -1326,26 +1391,36 @@ class PrefetchController(StorageControllerInterface):
             for global_i in load_bitmap.gather(plan_indices):
                 result_bitmap.set(global_i)
 
+        # Keys served from L1 in place are part of the result without a load.
+        resident_set = set(request.l1_resident_keys)
+        if resident_set:
+            for i, key in enumerate(request.keys):
+                if key in resident_set:
+                    result_bitmap.set(i)
+
         # Separate loaded vs. failed among write-reserved keys
         loaded_keys: list[ObjectKey] = result_bitmap.gather(request.keys)
         loaded_set = set(loaded_keys)
         failed_keys = [k for k in request.write_reserved_keys if k not in loaded_set]
+        transferred_keys = [k for k in loaded_keys if k in request.write_reserved_objs]
 
         # Phase 2 unlock: release L2 locks for all keys in the load plan
         self._unlock_all_plan_keys(request)
 
         l1_mgr = self._l1_manager
 
-        # Transition loaded keys out of write-locked state.
-        if loaded_keys:
+        # Transition loaded keys out of write-locked state. Resident keys were
+        # never write-locked: under LOOKUP they already hold this request's
+        # read locks, under WARM they hold nothing.
+        if transferred_keys:
             if request.mode is PrefetchMode.WARM:
                 # Warm: make ready, pin nothing.
-                l1_mgr.finish_write(loaded_keys)
+                l1_mgr.finish_write(transferred_keys)
             else:
                 # write-locked -> read-locked; extra_count so each TP worker
                 # gets its own read lock.
                 l1_mgr.finish_write_and_reserve_read(
-                    loaded_keys, extra_count=request.extra_count
+                    transferred_keys, extra_count=request.extra_count
                 )
 
         # Clean up failed keys
@@ -1358,7 +1433,8 @@ class PrefetchController(StorageControllerInterface):
                 event_type=EventType.L2_PREFETCH_LOAD_COMPLETED,
                 metadata={
                     "request_id": request.request_id,
-                    "loaded_count": len(loaded_keys),
+                    "loaded_count": len(transferred_keys),
+                    "resident_count": len(resident_set),
                     "failed_count": len(failed_keys),
                     "key_count_per_salt": Counter(k.cache_salt for k in loaded_keys),
                 },
@@ -1389,12 +1465,14 @@ class PrefetchController(StorageControllerInterface):
                 )
             )
 
-        # Release read locks for any loaded key outside the retained set
-        # (partial load failures can create gaps).
+        # Release read locks for any loaded or resident key outside the
+        # retained set (partial load failures can create gaps). Under WARM no
+        # key of this request holds a read lock, and a resident key may be
+        # locked by another reader, so nothing is released there.
         retained = build_trim_mask(result_bitmap, num_keys, request.policy)
         released_bitmap = result_bitmap & (~retained)
         released = released_bitmap.gather(request.keys)
-        if released:
+        if released and request.mode is not PrefetchMode.WARM:
             l1_mgr.finish_read(released, extra_count=request.extra_count)
 
         self._complete_request(request.request_id, retained)
