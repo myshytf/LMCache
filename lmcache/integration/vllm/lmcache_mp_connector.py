@@ -1553,12 +1553,21 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # deeper external tail in this runtime. Keep the external objects
         # locked only until update_state_after_alloc releases them, then
         # recompute the tail from the trusted local state.
-        if _should_skip_mixed_recurrent_retrieve(
+        #
+        # The verdict is re-derived on every query: the scheduler re-asks
+        # with the current local hit while the request waits, and that hit
+        # can be evicted to zero after a presence report was refused here.
+        # The loading lookup re-issued above must then be admitted as a
+        # retrieve; a verdict left over from the earlier query would make
+        # ``needs_retrieve`` refuse it after the scheduler has already parked
+        # the request in WAITING_FOR_REMOTE_KVS.
+        skip_mixed = _should_skip_mixed_recurrent_retrieve(
             self._has_recurrent_cache,
             num_computed_tokens,
             ret,
-        ):
-            tracker.skip_mixed_recurrent_retrieve = True
+        )
+        tracker.skip_mixed_recurrent_retrieve = skip_mixed
+        if skip_mixed:
             return 0, False
 
         need_to_load = max(0, ret - num_computed_tokens)
@@ -1611,13 +1620,36 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.admit_external_tokens(num_external_tokens)
         condition = tracker.needs_retrieve()
         if tracker.state == LMCacheMPRequestState.PREFETCHING:
-            # If need to retrieve, change to WAITING_FOR_LOAD
-            # Otherwise, change to READY
-            tracker.state = (
-                LMCacheMPRequestState.WAITING_FOR_LOAD
-                if condition
-                else LMCacheMPRequestState.READY
-            )
+            if num_external_tokens > 0 and not condition:
+                # The scheduler admitted an asynchronous load and parks the
+                # request in WAITING_FOR_REMOTE_KVS until a worker reports
+                # it, but this tracker will not emit a retrieve. Going READY
+                # here would strand the request forever. Stay
+                # WAITING_FOR_LOAD without a retrievable range:
+                # _process_retrieve_requests turns that into a suppressed
+                # retrieve, the workers report the load as failed and the
+                # scheduler recomputes the prefix.
+                logger.warning(
+                    "Request %s: the scheduler admitted %d external tokens "
+                    "but no retrieve can be issued (skip_mixed_recurrent=%s, "
+                    "vllm_hit=%d, lmcache_hit=%d, admitted_end=%d); "
+                    "reporting the load as failed so the prefix is recomputed",
+                    request.request_id,
+                    num_external_tokens,
+                    tracker.skip_mixed_recurrent_retrieve,
+                    tracker.num_vllm_hit_tokens,
+                    tracker.num_lmcache_hit_tokens,
+                    tracker.retrieve_end_token(1),
+                )
+                tracker.state = LMCacheMPRequestState.WAITING_FOR_LOAD
+            else:
+                # If need to retrieve, change to WAITING_FOR_LOAD
+                # Otherwise, change to READY
+                tracker.state = (
+                    LMCacheMPRequestState.WAITING_FOR_LOAD
+                    if condition
+                    else LMCacheMPRequestState.READY
+                )
             # Clean up lookup future in scheduler adapter
             self.scheduler_adapter.cleanup_lookup_result(request.request_id)
 
